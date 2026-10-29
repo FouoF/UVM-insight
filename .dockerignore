@@ -1,0 +1,8 @@
+bin/
+web/node_modules/
+web/dist/
+collector/build/
+examples/build/
+.git
+.DS_Store
+*.sock

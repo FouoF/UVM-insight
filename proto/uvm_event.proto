@@ -1,0 +1,106 @@
+// Wire format shared by the CUPTI collector and the local agent.
+//
+// The injected library encodes these messages by hand so it does not link
+// libprotobuf. The agent decodes the same schema. Field numbers and wire
+// types below are the contract; do not renumber them.
+//
+// Framing on the Unix socket: uint32 big-endian length, then one Envelope.
+
+syntax = "proto3";
+
+package uvminisight.v1;
+
+option go_package = "github.com/FouoF/UVM-insight/agent/pkg/protocol";
+
+message Envelope {
+  oneof body {
+    Hello hello = 1;
+    EventBatch batch = 2;
+  }
+}
+
+message Hello {
+  uint32 pid = 1;
+  string comm = 2;
+  string app_name = 3;
+  string hostname = 4;
+  string cuda_version = 5;
+  string driver_version = 6;
+  repeated GpuInfo gpus = 7;
+}
+
+message GpuInfo {
+  uint32 device_id = 1;
+  string uuid = 2;
+  string name = 3;
+  uint64 total_memory_bytes = 4;
+}
+
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_BYTES_HTOD = 1;
+  EVENT_KIND_BYTES_DTOH = 2;
+  EVENT_KIND_BYTES_DTOD = 3;
+  EVENT_KIND_CPU_PAGE_FAULT = 4;
+  EVENT_KIND_GPU_PAGE_FAULT = 5;
+  EVENT_KIND_THRASHING = 6;
+  EVENT_KIND_THROTTLING = 7;
+  EVENT_KIND_REMOTE_MAP = 8;
+  EVENT_KIND_MEMCPY_HTOD = 9;
+  EVENT_KIND_MEMCPY_DTOH = 10;
+  EVENT_KIND_MEMCPY_DTOD = 11;
+  EVENT_KIND_MEMCPY_OTHER = 12;
+}
+
+// Migration cause from CUpti_ActivityUnifiedMemoryMigrationCause.
+// Meaningful for HtoD and DtoH byte counters. Other records leave this unset.
+enum MigrationCause {
+  MIGRATION_CAUSE_UNKNOWN = 0;
+  MIGRATION_CAUSE_USER = 1;
+  MIGRATION_CAUSE_COHERENCE = 2;
+  MIGRATION_CAUSE_PREFETCH = 3;
+  MIGRATION_CAUSE_EVICTION = 4;
+  MIGRATION_CAUSE_ACCESS_COUNTERS = 5;
+}
+
+message UvmEvent {
+  EventKind kind = 1;
+  // Byte count for transfers, thrashing and remote map.
+  // GPU page fault: number of fault groups.
+  // CPU page fault: unused (each record is one fault; the faulting PC is not a size).
+  uint64 bytes = 2;
+  uint64 start_ns = 3;
+  uint64 end_ns = 4;
+  uint64 address = 5;
+  uint32 src_id = 6;
+  uint32 dst_id = 7;
+  MigrationCause cause = 8;
+  uint32 stream_id = 9;
+  uint32 correlation_id = 10;
+  uint32 device_id = 11;
+}
+
+message AllocEvent {
+  uint64 address = 1;
+  uint64 size = 2;
+  bool is_managed = 3;
+  bool is_free = 4;
+  uint64 timestamp_ns = 5;
+  uint32 device_id = 6;
+}
+
+message KernelEvent {
+  string name = 1;
+  uint64 start_ns = 2;
+  uint64 end_ns = 3;
+  uint32 device_id = 4;
+  uint32 correlation_id = 5;
+  uint32 stream_id = 6;
+}
+
+message EventBatch {
+  repeated UvmEvent uvm = 1;
+  repeated AllocEvent allocs = 2;
+  repeated KernelEvent kernels = 3;
+  uint64 dropped = 4;
+}
