@@ -60,6 +60,11 @@ func encodeHello(h Hello) []byte {
 	for _, g := range h.GPUs {
 		b = appendMessage(b, 7, encodeGPU(g))
 	}
+	b = appendVarintField(b, 8, h.ManagedBytes)
+	if h.ManagedKnown {
+		b = appendVarintField(b, 9, 1)
+	}
+	b = appendVarintField(b, 10, h.ResidentBytes)
 	return b
 }
 
@@ -84,6 +89,11 @@ func encodeBatch(batch EventBatch) []byte {
 		b = appendMessage(b, 3, encodeKernel(ev))
 	}
 	b = appendVarintField(b, 4, batch.Dropped)
+	b = appendVarintField(b, 5, batch.ManagedBytes)
+	if batch.ManagedKnown {
+		b = appendVarintField(b, 6, 1)
+	}
+	b = appendVarintField(b, 7, batch.ResidentBytes)
 	return b
 }
 
@@ -244,6 +254,14 @@ func decodeHello(b []byte) (Hello, error) {
 			}
 			h.GPUs = append(h.GPUs, g)
 			i = ni
+		case 8:
+			h.ManagedBytes, i, err = readVarint(b, i)
+		case 9:
+			var v uint64
+			v, i, err = readVarint(b, i)
+			h.ManagedKnown = v != 0
+		case 10:
+			h.ResidentBytes, i, err = readVarint(b, i)
 		default:
 			i, err = skip(b, i, wire)
 		}
@@ -332,6 +350,14 @@ func decodeBatch(b []byte) (EventBatch, error) {
 			i = ni
 		case 4:
 			batch.Dropped, i, err = readVarint(b, i)
+		case 5:
+			batch.ManagedBytes, i, err = readVarint(b, i)
+		case 6:
+			var v uint64
+			v, i, err = readVarint(b, i)
+			batch.ManagedKnown = v != 0
+		case 7:
+			batch.ResidentBytes, i, err = readVarint(b, i)
 		default:
 			i, err = skip(b, i, wire)
 		}

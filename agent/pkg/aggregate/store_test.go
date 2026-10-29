@@ -34,7 +34,8 @@ func TestMigrationAndManagedMemory(t *testing.T) {
 	if f.Src != "host" || f.Dst != "gpu0" || f.Direction != "htod" || f.Cause != "coherence" {
 		t.Fatalf("flow: %+v", f)
 	}
-	if f.MBps < 3.9 || f.MBps > 4.1 {
+	// 2 MB over a 1 s window whose newest slot has just started (0.9 s elapsed).
+	if f.MBps < 2.2 || f.MBps > 2.25 {
 		t.Fatalf("mbps = %v", f.MBps)
 	}
 	if len(snap.Nodes) < 2 {
@@ -58,5 +59,47 @@ func TestMigrationAndManagedMemory(t *testing.T) {
 	heat := s.Heatmap(7)
 	if len(heat.Cells) != 1 || heat.Cells[0].Bytes != 2_000_000 {
 		t.Fatalf("heat: %+v", heat.Cells)
+	}
+}
+
+func TestManagedGaugeSurvivesUnknownFree(t *testing.T) {
+	s := New(time.Minute)
+	now := time.Unix(1_700_000_000, 0)
+	s.SetClock(func() time.Time { return now })
+	s.Register(protocol.Hello{PID: 7, AppName: "app", ManagedBytes: 3 << 30, ManagedKnown: true})
+	if got := s.Snapshot(7).ManagedBytes; got != 3<<30 {
+		t.Fatalf("from hello = %d", got)
+	}
+	s.IngestAt(7, protocol.EventBatch{
+		ManagedBytes: 1500 << 20,
+		ManagedKnown: true,
+		Allocs:       []protocol.AllocEvent{{Address: 0xabc, Size: 1 << 30, IsManaged: true, IsFree: true}},
+	}, now)
+	if got := s.Snapshot(7).ManagedBytes; got != 1500<<20 {
+		t.Fatalf("gauge = %d", got)
+	}
+	s.IngestAt(7, protocol.EventBatch{ManagedBytes: 1500 << 20, ManagedKnown: true, ResidentBytes: 1 << 30}, now.Add(-3*time.Second))
+	s.IngestAt(7, protocol.EventBatch{ManagedBytes: 1500 << 20, ManagedKnown: true, ResidentBytes: 200 << 20}, now)
+	ov := s.Overview(0, true)
+	var live ProcLive
+	for _, p := range ov.Processes {
+		if p.PID == 7 {
+			live = p
+		}
+	}
+	if !live.ResidentKnown || live.ResidentBytes != 200<<20 {
+		t.Fatalf("resident: %+v", live)
+	}
+	n := len(live.Series)
+	if live.Series[n-2].ResidentMB != float64(1<<30)/1e6 || live.Series[n-1].ResidentMB != float64(200<<20)/1e6 {
+		t.Fatalf("carry forward: %v %v", live.Series[n-2].ResidentMB, live.Series[n-1].ResidentMB)
+	}
+
+	s.Register(protocol.Hello{PID: 8, AppName: "old"})
+	s.IngestAt(8, protocol.EventBatch{
+		Allocs: []protocol.AllocEvent{{Address: 0x99, Size: 8 << 20, IsManaged: true, IsFree: true}},
+	}, now)
+	if got := s.Snapshot(8).ManagedBytes; got != 0 {
+		t.Fatalf("unknown free changed managed to %d", got)
 	}
 }

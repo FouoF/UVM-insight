@@ -46,6 +46,9 @@ type Hello struct {
 	CudaVersion   string
 	DriverVersion string
 	GPUs          []GpuInfo
+	ManagedBytes  uint64
+	ManagedKnown  bool
+	ResidentBytes uint64
 }
 
 type UvmEvent struct {
@@ -81,10 +84,13 @@ type KernelEvent struct {
 }
 
 type EventBatch struct {
-	Uvm     []UvmEvent
-	Allocs  []AllocEvent
-	Kernels []KernelEvent
-	Dropped uint64
+	Uvm           []UvmEvent
+	Allocs        []AllocEvent
+	Kernels       []KernelEvent
+	Dropped       uint64
+	ManagedBytes  uint64
+	ManagedKnown  bool
+	ResidentBytes uint64
 }
 
 type Envelope struct {

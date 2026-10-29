@@ -27,6 +27,13 @@ message Hello {
   string cuda_version = 5;
   string driver_version = 6;
   repeated GpuInfo gpus = 7;
+  // Virtual size of this process's /dev/nvidia-uvm mappings. Absolute, so a
+  // reconnected agent does not have to replay every alloc. Zero is valid;
+  // managed_known says the collector actually read the map.
+  uint64 managed_bytes = 8;
+  bool managed_known = 9;
+  // Estimated part of managed_bytes resident on the GPU. Valid with managed_known.
+  uint64 gpu_resident_bytes = 10;
 }
 
 message GpuInfo {
@@ -103,4 +110,7 @@ message EventBatch {
   repeated AllocEvent allocs = 2;
   repeated KernelEvent kernels = 3;
   uint64 dropped = 4;
+  uint64 managed_bytes = 5;
+  bool managed_known = 6;
+  uint64 gpu_resident_bytes = 7;
 }

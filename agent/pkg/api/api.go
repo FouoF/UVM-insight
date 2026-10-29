@@ -35,6 +35,12 @@ func Handler(st *aggregate.Store, web fs.FS) http.Handler {
 	mux.HandleFunc("GET /api/stream", func(w http.ResponseWriter, r *http.Request) {
 		stream(st, w, r)
 	})
+	mux.HandleFunc("GET /api/overview", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, st.Overview(0, true))
+	})
+	mux.HandleFunc("GET /api/live", func(w http.ResponseWriter, r *http.Request) {
+		live(st, w, r)
+	})
 	if web != nil {
 		mux.Handle("/", spa(web))
 	}
@@ -85,6 +91,36 @@ func stream(st *aggregate.Store, w http.ResponseWriter, r *http.Request) {
 			return
 		case <-ticker.C:
 			if err := send(); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func live(st *aggregate.Store, w http.ResponseWriter, r *http.Request) {
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: []string{"*"}})
+	if err != nil {
+		return
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	ctx := conn.CloseRead(r.Context())
+	first := st.Overview(0, true)
+	since := first.LastSeq
+	if err := wsjson.Write(ctx, conn, first); err != nil {
+		return
+	}
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			msg := st.Overview(since, false)
+			if msg.LastSeq > since {
+				since = msg.LastSeq
+			}
+			if err := wsjson.Write(ctx, conn, msg); err != nil {
 				return
 			}
 		}

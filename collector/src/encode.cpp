@@ -96,7 +96,65 @@ void encodeHello(Buf& envelope, const Hello& hello) {
     writeGpu(g, gpu);
     body.msg(7, g);
   }
+  body.varint(8, hello.managed_bytes);
+  if (hello.managed_known) {
+    body.varint(9, 1);
+  }
+  body.varint(10, hello.gpu_resident_bytes);
   envelope.msg(1, body);
+}
+
+bool parseHex(std::string_view s, uint64_t* out) {
+  if (s.empty()) {
+    return false;
+  }
+  uint64_t v = 0;
+  for (unsigned char c : s) {
+    uint64_t d;
+    if (c >= '0' && c <= '9') {
+      d = c - '0';
+    } else if (c >= 'a' && c <= 'f') {
+      d = c - 'a' + 10;
+    } else if (c >= 'A' && c <= 'F') {
+      d = c - 'A' + 10;
+    } else {
+      return false;
+    }
+    v = (v << 4) | d;
+  }
+  *out = v;
+  return true;
+}
+
+uint64_t sumNvidiaUvmMaps(std::string_view text) {
+  uint64_t sum = 0;
+  size_t i = 0;
+  while (i < text.size()) {
+    size_t eol = text.find('\n', i);
+    if (eol == std::string_view::npos) {
+      eol = text.size();
+    }
+    const std::string_view line = text.substr(i, eol - i);
+    i = eol < text.size() ? eol + 1 : text.size();
+    if (line.find("nvidia-uvm-tools") != std::string_view::npos) {
+      continue;
+    }
+    if (line.find("/dev/nvidia-uvm") == std::string_view::npos) {
+      continue;
+    }
+    const size_t dash = line.find('-');
+    const size_t sp = line.find(' ');
+    if (dash == std::string_view::npos || sp == std::string_view::npos || dash >= sp) {
+      continue;
+    }
+    uint64_t start = 0;
+    uint64_t end = 0;
+    if (!parseHex(line.substr(0, dash), &start) || !parseHex(line.substr(dash + 1, sp - dash - 1), &end) || end <= start) {
+      continue;
+    }
+    sum += end - start;
+  }
+  return sum;
 }
 
 void encodeBatch(Buf& envelope, const EventBatch& batch) {
@@ -117,6 +175,11 @@ void encodeBatch(Buf& envelope, const EventBatch& batch) {
     body.msg(3, m);
   }
   body.varint(4, batch.dropped);
+  body.varint(5, batch.managed_bytes);
+  if (batch.managed_known) {
+    body.varint(6, 1);
+  }
+  body.varint(7, batch.gpu_resident_bytes);
   envelope.msg(2, body);
 }
 

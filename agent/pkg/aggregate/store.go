@@ -23,6 +23,7 @@ type Store struct {
 	retention time.Duration
 	now       func() time.Time
 	procs     map[uint32]*proc
+	seq       uint64
 }
 
 func New(retention time.Duration) *Store {
@@ -102,7 +103,7 @@ func (s *Store) Expire() {
 func (s *Store) registerLocked(h protocol.Hello, at time.Time) {
 	p := s.procs[h.PID]
 	if p == nil {
-		p = newProc()
+		p = newProc(&s.seq)
 		s.procs[h.PID] = p
 	}
 	p.hello = h
@@ -112,12 +113,17 @@ func (s *Store) registerLocked(h protocol.Hello, at time.Time) {
 	p.active = true
 	p.exited = nil
 	p.lastSeen = at
+	if h.ManagedKnown {
+		p.managed = h.ManagedBytes
+		p.resident = h.ResidentBytes
+		p.managedKnown = true
+	}
 }
 
 func (s *Store) ingestLocked(pid uint32, batch protocol.EventBatch, at time.Time) {
 	p := s.procs[pid]
 	if p == nil {
-		p = newProc()
+		p = newProc(&s.seq)
 		p.hello.PID = pid
 		p.hello.AppName = fmt.Sprintf("pid-%d", pid)
 		s.procs[pid] = p
@@ -126,9 +132,19 @@ func (s *Store) ingestLocked(pid uint32, batch protocol.EventBatch, at time.Time
 	p.lastSeen = at
 	p.dropped += batch.Dropped
 	p.observeClock(batch, at)
+	if batch.ManagedKnown {
+		p.managed = batch.ManagedBytes
+		p.resident = batch.ResidentBytes
+		p.managedKnown = true
+		b := p.bucket(at.Unix())
+		b.resident = batch.ResidentBytes
+		b.hasResident = true
+	}
 
-	for _, ev := range batch.Allocs {
-		p.noteAlloc(ev)
+	if !p.managedKnown {
+		for _, ev := range batch.Allocs {
+			p.noteAlloc(ev)
+		}
 	}
 	for _, ev := range batch.Uvm {
 		p.noteUvm(ev, at)
@@ -139,33 +155,40 @@ func (s *Store) ingestLocked(pid uint32, batch protocol.EventBatch, at time.Time
 }
 
 type proc struct {
-	hello     protocol.Hello
-	active    bool
-	lastSeen  time.Time
-	exited    *time.Time
-	managed   uint64
-	dropped   uint64
-	allocs    map[uint64]uint64
-	buckets   map[int64]*second
-	heat      map[heatKey]uint64
-	events    []EventView
-	seq       uint64
-	kernels   []KernelView
-	migrated  map[seriesKey]uint64
-	explicit  map[seriesKey]uint64
-	faults    map[faultKey]uint64
-	thrash    map[simpleKey]uint64
-	throttle  map[simpleKey]uint64
-	remote    map[simpleKey]uint64
-	hists     map[seriesKey]*histogram
-	offsetSet bool
-	offset    int64
+	hello        protocol.Hello
+	active       bool
+	lastSeen     time.Time
+	exited       *time.Time
+	managed      uint64
+	managedKnown bool
+	resident     uint64
+	dropped      uint64
+	allocs       map[uint64]uint64
+	buckets      map[int64]*second
+	fine         map[int64]*fineSlot
+	heat         map[heatKey]uint64
+	events       []EventView
+	evPos        int
+	seq          uint64
+	seqSrc       *uint64
+	kernels      []KernelView
+	migrated     map[seriesKey]uint64
+	explicit     map[seriesKey]uint64
+	faults       map[faultKey]uint64
+	thrash       map[simpleKey]uint64
+	throttle     map[simpleKey]uint64
+	remote       map[simpleKey]uint64
+	hists        map[seriesKey]*histogram
+	offsetSet    bool
+	offset       int64
 }
 
-func newProc() *proc {
+func newProc(seq *uint64) *proc {
 	return &proc{
+		seqSrc:   seq,
 		allocs:   map[uint64]uint64{},
 		buckets:  map[int64]*second{},
+		fine:     map[int64]*fineSlot{},
 		heat:     map[heatKey]uint64{},
 		migrated: map[seriesKey]uint64{},
 		explicit: map[seriesKey]uint64{},
@@ -190,6 +213,9 @@ type second struct {
 	thrash     uint64
 	throttle   uint64
 	remote     uint64
+	// Last resident estimate reported in this second.
+	resident    uint64
+	hasResident bool
 }
 
 func (p *proc) bucket(sec int64) *second {
@@ -283,13 +309,17 @@ func (p *proc) noteAlloc(ev protocol.AllocEvent) {
 			p.managed = 0
 		}
 		delete(p.allocs, ev.Address)
-		return
 	}
-	if p.managed >= ev.Size {
-		p.managed -= ev.Size
-	} else {
-		p.managed = 0
+	// A release for an address this agent never saw (it restarted, or the
+	// alloc record was dropped) is not a reason to shrink the total.
+}
+
+// A zero byte count is one record. Aggregated batches put the record count here.
+func eventCount(ev protocol.UvmEvent) uint64 {
+	if ev.Bytes == 0 {
+		return 1
 	}
+	return ev.Bytes
 }
 
 func (p *proc) noteUvm(ev protocol.UvmEvent, at time.Time) {
@@ -298,6 +328,7 @@ func (p *proc) noteUvm(ev protocol.UvmEvent, at time.Time) {
 	cause := causeName(ev.Cause)
 	sec := at.Unix()
 	b := p.bucket(sec)
+	fs := p.slot(at)
 	when := p.wall(ev.EndNs, at)
 
 	view := EventView{
@@ -318,7 +349,9 @@ func (p *proc) noteUvm(ev protocol.UvmEvent, at time.Time) {
 	case protocol.KindBytesHtoD, protocol.KindBytesDtoH, protocol.KindBytesDtoD:
 		key := seriesKey{gpu: gpu, direction: direction, cause: cause}
 		p.migrated[key] += ev.Bytes
-		b.flows[flowKey{src: src, dst: dst, direction: direction, cause: cause}] += ev.Bytes
+		fk := flowKey{src: src, dst: dst, direction: direction, cause: cause}
+		b.flows[fk] += ev.Bytes
+		fs.flows[fk] += ev.Bytes
 		switch ev.Kind {
 		case protocol.KindBytesHtoD:
 			b.htod += ev.Bytes
@@ -339,7 +372,9 @@ func (p *proc) noteUvm(ev protocol.UvmEvent, at time.Time) {
 	case protocol.KindMemcpyHtoD, protocol.KindMemcpyDtoH, protocol.KindMemcpyDtoD, protocol.KindMemcpyOther:
 		key := seriesKey{gpu: gpu, direction: direction, cause: "explicit"}
 		p.explicit[key] += ev.Bytes
-		b.flows[flowKey{src: src, dst: dst, direction: direction, cause: "explicit"}] += ev.Bytes
+		fk := flowKey{src: src, dst: dst, direction: direction, cause: "explicit"}
+		b.flows[fk] += ev.Bytes
+		fs.flows[fk] += ev.Bytes
 		switch ev.Kind {
 		case protocol.KindMemcpyHtoD:
 			b.memcpyHtod += ev.Bytes
@@ -349,24 +384,28 @@ func (p *proc) noteUvm(ev protocol.UvmEvent, at time.Time) {
 			b.memcpyDtod += ev.Bytes
 		}
 	case protocol.KindCPUPageFault:
-		p.faults[faultKey{gpu: gpu, side: "cpu"}]++
-		b.cpuFaults++
+		n := eventCount(ev)
+		p.faults[faultKey{gpu: gpu, side: "cpu"}] += n
+		b.cpuFaults += n
+		fs.cpuFaults += n
 	case protocol.KindGPUPageFault:
-		n := ev.Bytes
-		if n == 0 {
-			n = 1
-		}
+		n := eventCount(ev)
 		p.faults[faultKey{gpu: gpu, side: "gpu"}] += n
 		b.gpuFaults += n
+		fs.gpuFaults += n
 	case protocol.KindThrashing:
-		p.thrash[simpleKey{gpu: gpu}]++
-		b.thrash++
+		n := eventCount(ev)
+		p.thrash[simpleKey{gpu: gpu}] += n
+		b.thrash += n
+		fs.thrash += n
 	case protocol.KindThrottling:
-		p.throttle[simpleKey{gpu: gpu}]++
-		b.throttle++
+		n := eventCount(ev)
+		p.throttle[simpleKey{gpu: gpu}] += n
+		b.throttle += n
 	case protocol.KindRemoteMap:
-		p.remote[simpleKey{gpu: gpu}]++
-		b.remote++
+		n := eventCount(ev)
+		p.remote[simpleKey{gpu: gpu}] += n
+		b.remote += n
 	}
 }
 
@@ -388,12 +427,30 @@ func (p *proc) noteKernel(ev protocol.KernelEvent, at time.Time) {
 }
 
 func (p *proc) pushEvent(ev EventView) {
-	p.seq++
+	*p.seqSrc++
+	p.seq = *p.seqSrc
 	ev.Seq = p.seq
-	p.events = append(p.events, ev)
-	if len(p.events) > maxEvents {
-		p.events = append([]EventView(nil), p.events[len(p.events)-maxEvents:]...)
+	ev.PID = p.hello.PID
+	ev.App = p.app()
+	if len(p.events) < maxEvents {
+		p.events = append(p.events, ev)
+		return
 	}
+	p.events[p.evPos] = ev
+	p.evPos++
+	if p.evPos == len(p.events) {
+		p.evPos = 0
+	}
+}
+
+func (p *proc) orderedEvents() []EventView {
+	if p.evPos == 0 || len(p.events) < maxEvents {
+		return p.events
+	}
+	out := make([]EventView, 0, len(p.events))
+	out = append(out, p.events[p.evPos:]...)
+	out = append(out, p.events[:p.evPos]...)
+	return out
 }
 
 func (p *proc) observeDuration(key seriesKey, ev protocol.UvmEvent) {
@@ -599,10 +656,13 @@ type Point struct {
 	Thrashing  float64 `json:"thrashing"`
 	Throttling float64 `json:"throttling"`
 	RemoteMap  float64 `json:"remoteMap"`
+	ResidentMB float64 `json:"residentMb"`
 }
 
 type EventView struct {
 	Seq        uint64  `json:"seq"`
+	PID        uint32  `json:"pid"`
+	App        string  `json:"app"`
 	Time       int64   `json:"time"`
 	Kind       string  `json:"kind"`
 	Cause      string  `json:"cause"`
@@ -730,7 +790,7 @@ func (s *Store) Snapshot(pid uint32) Snapshot {
 		if p.seq > lastSeq {
 			lastSeq = p.seq
 		}
-		snap.Events = append(snap.Events, tail(p.events, 100)...)
+		snap.Events = append(snap.Events, tail(p.orderedEvents(), 100)...)
 	}
 	sort.Slice(snap.Events, func(i, j int) bool { return snap.Events[i].Seq > snap.Events[j].Seq })
 	if len(snap.Events) > 100 {
@@ -787,7 +847,7 @@ func (s *Store) Stream(pid uint32, since uint64) Stream {
 			msg.LastSeq = p.seq
 		}
 		msg.Kernels = append(msg.Kernels, p.recentKernels(now)...)
-		for _, ev := range p.events {
+		for _, ev := range p.orderedEvents() {
 			if ev.Seq > since {
 				msg.Events = append(msg.Events, ev)
 			}
@@ -881,20 +941,60 @@ func (s *Store) flowsLocked(procs []*proc, now time.Time) []Flow {
 	return out
 }
 
+// Live rates use 100 ms slots over a 1 s trailing window. The collector
+// flushes every 200 ms, so the window spans about five deliveries, while a
+// page-in burst of one or two seconds still shows its real peak and end.
+const (
+	slotMs       = 100
+	rateWindowMs = 1000
+	rateSlots    = rateWindowMs / slotMs
+)
+
+type fineSlot struct {
+	flows     map[flowKey]uint64
+	gpuFaults uint64
+	cpuFaults uint64
+	thrash    uint64
+}
+
+func (p *proc) slot(at time.Time) *fineSlot {
+	id := at.UnixMilli() / slotMs
+	fs := p.fine[id]
+	if fs == nil {
+		if len(p.fine) > 4*rateSlots {
+			for k := range p.fine {
+				if k <= id-2*rateSlots {
+					delete(p.fine, k)
+				}
+			}
+		}
+		fs = &fineSlot{flows: map[flowKey]uint64{}}
+		p.fine[id] = fs
+	}
+	return fs
+}
+
+// rateSpan covers the last rateSlots slots; the newest one is still filling,
+// so the divisor counts only its elapsed part.
+func rateSpan(now time.Time) (from, to int64, div float64) {
+	ms := now.UnixMilli()
+	to = ms / slotMs
+	elapsed := float64(ms%slotMs) / 1000
+	return to - rateSlots + 1, to, float64(rateSlots-1)*slotMs/1000 + elapsed
+}
+
 func (p *proc) rates(now time.Time) []Flow {
-	sec := now.Unix()
-	elapsed := now.Sub(time.Unix(sec, 0))
-	b := p.buckets[sec]
-	div := elapsed.Seconds()
-	if elapsed < 200*time.Millisecond || b == nil {
-		b = p.buckets[sec-1]
-		div = 1
+	from, to, div := rateSpan(now)
+	acc := map[flowKey]uint64{}
+	for id := from; id <= to; id++ {
+		if fs := p.fine[id]; fs != nil {
+			for k, v := range fs.flows {
+				acc[k] += v
+			}
+		}
 	}
-	if b == nil || div <= 0 {
-		return nil
-	}
-	out := make([]Flow, 0, len(b.flows))
-	for k, bytes := range b.flows {
+	out := make([]Flow, 0, len(acc))
+	for k, bytes := range acc {
 		if bytes == 0 {
 			continue
 		}

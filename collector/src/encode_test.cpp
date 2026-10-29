@@ -83,6 +83,15 @@ int main(int argc, char** argv) {
     return fail("batch envelope tag");
   }
 
+  const char* maps =
+      "7f0000000000-7f0000200000 rw-s 00000000 00:00 0 /dev/nvidia-uvm\n"
+      "7f1000000000-7f1000001000 rw-s 00000000 00:00 0 /dev/nvidia-uvm-tools\n"
+      "7f2000000000-7f2000100000 rw-p 00000000 00:00 0 [heap]\n"
+      "7f3000000000-7f3000002000 rw-s 00000000 00:00 0 /dev/nvidia-uvm\n";
+  if (uvm::sumNvidiaUvmMaps(maps) != (0x200000ull + 0x2000ull)) {
+    return fail("uvm map sum");
+  }
+
   const char* path = argc > 1 ? argv[1] : "proto/testdata/sample.frames";
   std::ofstream out(path, std::ios::binary);
   if (!out) {

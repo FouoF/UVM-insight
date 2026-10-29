@@ -15,7 +15,6 @@ export type ProcessInfo = {
   gpus: GpuInfo[];
   managedBytes: number;
   active: boolean;
-  dropped: number;
   lastSeen: number;
 };
 
@@ -48,10 +47,13 @@ export type Point = {
   thrashing: number;
   throttling: number;
   remoteMap: number;
+  residentMb?: number;
 };
 
 export type EventView = {
   seq: number;
+  pid: number;
+  app: string;
   time: number;
   kind: string;
   cause: string;
@@ -74,7 +76,6 @@ export type KernelView = {
 export type Snapshot = {
   pid: number;
   managedBytes: number;
-  dropped: number;
   nodes: NodeInfo[];
   flows: Flow[];
   points: Point[];
@@ -98,7 +99,6 @@ export type Heatmap = {
 export type StreamMsg = {
   now: number;
   managedBytes: number;
-  dropped: number;
   active: boolean;
   flows: Flow[];
   point: Point | null;
@@ -106,6 +106,59 @@ export type StreamMsg = {
   events: EventView[];
   lastSeq: number;
 };
+
+export type Lane = {
+  gpu: string;
+  htod: number;
+  dtoh: number;
+  memcpyHtod: number;
+  memcpyDtoh: number;
+  quotaBytes: number;
+  deviceLabel: string;
+};
+
+export type ProcLive = {
+  pid: number;
+  appName: string;
+  hostname: string;
+  cudaVersion: string;
+  active: boolean;
+  lastSeen: number;
+  managedBytes: number;
+  residentBytes: number;
+  residentKnown: boolean;
+  htod: number;
+  dtoh: number;
+  memcpy: number;
+  gpuFaults: number;
+  cpuFaults: number;
+  thrashing: number;
+  migratedHtod: number;
+  migratedDtoh: number;
+  lanes: Lane[];
+  series: Point[];
+};
+
+export type GPUView = {
+  id: string;
+  name: string;
+  uuid: string;
+  memoryBytes: number;
+};
+
+export type Overview = {
+  now: number;
+  windowMs: number;
+  gpus: GPUView[];
+  processes: ProcLive[];
+  events: EventView[];
+  lastSeq: number;
+};
+
+export function liveURL(): string {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${location.host}/api/live`;
+}
 
 async function getJSON<T>(url: string): Promise<T> {
   const res = await fetch(url);

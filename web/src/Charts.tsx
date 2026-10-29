@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import * as echarts from "echarts";
-import type { Heatmap, KernelView, Point } from "./api";
+import type { Heatmap, Point } from "./api";
 
 const text = "#8ea0b5";
 const split = "#243041";
@@ -21,69 +21,122 @@ function useChart(option: echarts.EChartsCoreOption) {
     };
   }, []);
   useEffect(() => {
-    chart.current?.setOption(option, { notMerge: true });
+    chart.current?.setOption(option, { replaceMerge: ["series"] });
   }, [option]);
   return ref;
 }
 
-export function BandwidthChart({ points, kernels }: { points: Point[]; kernels: KernelView[] }) {
-  const areas = kernels.slice(-12).map((k) => [
-    { xAxis: k.start, name: k.name },
-    { xAxis: k.end },
+export type ProcSeries = { pid: number; name: string; color: string; points: Point[] };
+
+function perSecond(points: Point[], pick: (p: Point) => number): [number, number][] {
+  return points.map((p) => [p.t, round(pick(p))]);
+}
+
+function timeAxis() {
+  return { type: "time", axisLabel: { color: text, hideOverlap: true }, axisLine: { lineStyle: { color: split } } };
+}
+
+function valueAxis(name: string) {
+  return {
+    type: "value",
+    name,
+    nameTextStyle: { color: text },
+    axisLabel: { color: text },
+    splitLine: { lineStyle: { color: split } },
+  };
+}
+
+export function ProcBandwidthChart({ procs }: { procs: ProcSeries[] }) {
+  const series = procs.flatMap((p) => [
+    {
+      name: `${p.name} 迁入`,
+      type: "line",
+      stack: "in",
+      smooth: true,
+      showSymbol: false,
+      color: p.color,
+      lineStyle: { width: 1.5 },
+      areaStyle: { opacity: 0.28 },
+      data: perSecond(p.points, (x) => x.htod + x.memcpyHtod),
+    },
+    {
+      name: `${p.name} 迁回`,
+      type: "line",
+      stack: "out",
+      smooth: true,
+      showSymbol: false,
+      color: p.color,
+      lineStyle: { width: 1.5, type: "dashed" },
+      areaStyle: { opacity: 0.1 },
+      data: perSecond(p.points, (x) => -(x.dtoh + x.memcpyDtoh)),
+    },
   ]);
   const ref = useChart({
     backgroundColor: "transparent",
-    tooltip: { trigger: "axis" },
-    legend: { textStyle: { color: text }, top: 0, data: ["迁入显存", "迁回主机", "卡间", "显式拷贝"] },
-    grid: { left: 52, right: 16, top: 36, bottom: 28 },
-    xAxis: { type: "time", axisLabel: { color: text }, axisLine: { lineStyle: { color: split } } },
-    yAxis: {
-      type: "value",
-      name: "MB/s",
-      nameTextStyle: { color: text },
-      axisLabel: { color: text },
-      splitLine: { lineStyle: { color: split } },
+    animation: false,
+    tooltip: {
+      trigger: "axis",
+      valueFormatter: (v: number) => `${Math.abs(v).toFixed(1)} MB/s`,
     },
-    series: [
-      series("迁入显存", "#6ea8fe", points.map((p) => [p.t, round(p.htod)]), "uvm"),
-      series("迁回主机", "#3dbe7a", points.map((p) => [p.t, round(p.dtoh)]), "uvm"),
-      series("卡间", "#c792ea", points.map((p) => [p.t, round(p.dtod)]), ""),
-      series("显式拷贝", "#e6b450", points.map((p) => [p.t, round(p.memcpyHtod + p.memcpyDtoh + p.memcpyDtod)]), ""),
-      {
-        name: "kernel",
-        type: "line",
-        data: [],
-        markArea: {
-          itemStyle: { color: "rgba(110,168,254,0.08)" },
-          label: { color: text, fontSize: 10 },
-          data: areas,
-        },
-      },
-    ],
+    legend: { show: false },
+    grid: { left: 56, right: 16, top: 34, bottom: 28 },
+    xAxis: timeAxis(),
+    yAxis: {
+      ...valueAxis("MB/s  ↑迁入 ↓迁回"),
+      axisLabel: { color: text, formatter: (v: number) => String(Math.abs(v)) },
+    },
+    series,
   });
   return <div ref={ref} className="chart" />;
 }
 
-export function FaultChart({ points }: { points: Point[] }) {
+export function ResidentChart({ procs }: { procs: ProcSeries[] }) {
   const ref = useChart({
     backgroundColor: "transparent",
-    tooltip: { trigger: "axis" },
-    legend: { textStyle: { color: text }, top: 0 },
-    grid: { left: 46, right: 16, top: 36, bottom: 28 },
-    xAxis: { type: "time", axisLabel: { color: text }, axisLine: { lineStyle: { color: split } } },
-    yAxis: {
-      type: "value",
-      name: "次/秒",
-      nameTextStyle: { color: text },
-      axisLabel: { color: text },
-      splitLine: { lineStyle: { color: split } },
+    animation: false,
+    tooltip: {
+      trigger: "axis",
+      valueFormatter: (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(2)} GB` : `${v.toFixed(0)} MB`),
     },
-    series: [
-      line("CPU 缺页", "#6ea8fe", points.map((p) => [p.t, p.cpuFaults])),
-      line("GPU 缺页", "#e6b450", points.map((p) => [p.t, p.gpuFaults])),
-      line("抖动", "#ef6b6b", points.map((p) => [p.t, p.thrashing])),
-      line("节流", "#c792ea", points.map((p) => [p.t, p.throttling])),
-    ],
+    legend: { show: false },
+    grid: { left: 56, right: 16, top: 30, bottom: 28 },
+    xAxis: timeAxis(),
+    yAxis: {
+      ...valueAxis("GB"),
+      axisLabel: { color: text, formatter: (v: number) => (v / 1000).toFixed(1) },
+    },
+    series: procs.map((p) => ({
+      name: p.name,
+      type: "line",
+      stack: "resident",
+      step: "end",
+      showSymbol: false,
+      color: p.color,
+      lineStyle: { width: 1 },
+      areaStyle: { opacity: 0.45 },
+      data: perSecond(p.points, (x) => x.residentMb ?? 0),
+    })),
+  });
+  return <div ref={ref} className="chart chart-short" />;
+}
+
+export function ProcFaultChart({ procs }: { procs: ProcSeries[] }) {
+  const ref = useChart({
+    backgroundColor: "transparent",
+    animation: false,
+    tooltip: { trigger: "axis", valueFormatter: (v: number) => `${v.toFixed(0)} 次/秒` },
+    legend: { show: false },
+    grid: { left: 56, right: 16, top: 34, bottom: 28 },
+    xAxis: timeAxis(),
+    yAxis: valueAxis("次/秒"),
+    series: procs.map((p) => ({
+      name: p.name,
+      type: "line",
+      smooth: true,
+      showSymbol: false,
+      color: p.color,
+      data: perSecond(p.points, (x) => x.gpuFaults + x.cpuFaults),
+    })),
   });
   return <div ref={ref} className="chart" />;
 }
@@ -138,23 +191,6 @@ export function HeatChart({ heat }: { heat: Heatmap }) {
     series: [{ type: "heatmap", data, progressive: 2000 }],
   });
   return <div ref={ref} className="chart chart-heat" />;
-}
-
-function series(name: string, color: string, data: (number | string)[][], stack: string) {
-  return {
-    name,
-    type: "line",
-    stack: stack || undefined,
-    smooth: true,
-    showSymbol: false,
-    color,
-    areaStyle: stack ? { opacity: 0.25 } : undefined,
-    data,
-  };
-}
-
-function line(name: string, color: string, data: number[][]) {
-  return { name, type: "line", smooth: true, showSymbol: false, color, data };
 }
 
 function round(v: number): number {

@@ -22,9 +22,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
+#include <iterator>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -37,10 +41,27 @@
 
 namespace {
 
-constexpr size_t kBufferBytes = 1 << 20;
-constexpr size_t kMaxPendingEvents = 100000;
+// CUPTI recommends 1–10 MB buffers handed back from a pool. Returning a null
+// buffer makes CUPTI drop records instead of stalling the application.
+constexpr size_t kBufferBytes = 4 << 20;
+constexpr int kPoolCap = 8;
+constexpr uint64_t kAddrBucket = 2ull << 20;
+constexpr size_t kMaxPendingEvents = 4096;
 constexpr size_t kMaxQueuedFrames = 32;
 constexpr uint32_t kCpuId = 0xffffffffu;
+
+struct AggKey {
+  uint32_t kind = 0;
+  uint32_t cause = 0;
+  uint32_t src = 0;
+  uint32_t dst = 0;
+  uint32_t device = 0;
+  uint64_t addr = 0;
+  bool operator<(const AggKey& o) const {
+    return std::tie(kind, cause, src, dst, device, addr) <
+           std::tie(o.kind, o.cause, o.src, o.dst, o.device, o.addr);
+  }
+};
 
 struct UmView {
   CUpti_ActivityKind kind;
@@ -75,7 +96,14 @@ struct MemcpyPrefix {
 
 static_assert(offsetof(CUpti_ActivityUnifiedMemoryCounter2, address) == offsetof(UmView, address),
               "unified memory counter prefix drifted");
-static_assert(offsetof(CUpti_ActivityMemory4, bytes) > 0, "memory record");
+// Current toolkits emit CUpti_ActivityMemory4 for MEMORY2. CUDA 12.1 still
+// defines Memory3. The fields this collector reads exist on both records.
+#if CUDA_VERSION >= 12030
+using ActivityMemory = CUpti_ActivityMemory4;
+#else
+using ActivityMemory = CUpti_ActivityMemory3;
+#endif
+static_assert(offsetof(ActivityMemory, bytes) > 0, "memory record");
 static_assert(offsetof(CUpti_ActivityKernel9, name) > 0, "kernel record");
 
 #if UVMI_READ_UM_FLAGS
@@ -109,6 +137,19 @@ struct Collector {
 
   std::mutex mu;
   Pending pending;
+  // Byte totals for one flush window, keyed like Nsight's per-address summary.
+  std::map<AggKey, uint64_t> agg;
+
+  std::mutex bufMu;
+  std::vector<uint8_t*> freeBufs;
+  struct Filled {
+    uint8_t* data = nullptr;
+    size_t valid = 0;
+    CUcontext ctx = nullptr;
+    uint32_t stream = 0;
+  };
+  std::deque<Filled> filled;
+  bool poolReady = false;
 
   std::mutex sendMu;
   int fd = -1;
@@ -116,6 +157,18 @@ struct Collector {
   uint64_t unsentDrops = 0;
   uvm::Hello hello;
   bool helloReady = false;
+  uint64_t managedBytes = 0;
+  uint64_t managedSent = 0;
+  bool managedKnown = false;
+  bool managedSentValid = false;
+  // Bytes moved onto the GPU minus bytes evicted, since attach. First-touch
+  // population on the GPU and frees produce no transfer record, so the
+  // resident estimate is this net minus a floor that is pulled along whenever
+  // the estimate would leave [0, managedBytes].
+  int64_t netIn = 0;
+  int64_t netFloor = 0;
+  uint64_t resident = 0;
+  uint64_t residentSent = 0;
 
   std::mutex dropMu;
   std::vector<std::pair<uint64_t, size_t>> dropBase;
@@ -242,6 +295,8 @@ uint32_t deviceFor(CUpti_ActivityUnifiedMemoryCounterKind kind, uint32_t src, ui
   }
 }
 
+void fold(const uvm::UvmEvent& ev);
+
 void onUnified(const CUpti_Activity* rec) {
   UmView view{};
   size_t n = offsetof(UmView, flags);
@@ -308,13 +363,57 @@ void onUnified(const CUpti_Activity* rec) {
       return;
   }
 
+  fold(ev);
+}
+
+bool isTransfer(uvm::EventKind kind) {
+  switch (kind) {
+    case uvm::EventKind::kBytesHtoD:
+    case uvm::EventKind::kBytesDtoH:
+    case uvm::EventKind::kBytesDtoD:
+    case uvm::EventKind::kMemcpyHtoD:
+    case uvm::EventKind::kMemcpyDtoH:
+    case uvm::EventKind::kMemcpyDtoD:
+    case uvm::EventKind::kMemcpyOther:
+    case uvm::EventKind::kRemoteMap:
+      return true;
+    default:
+      return false;
+  }
+}
+
+void fold(const uvm::UvmEvent& ev) {
+  AggKey key;
+  key.kind = static_cast<uint32_t>(ev.kind);
+  key.cause = static_cast<uint32_t>(ev.cause);
+  key.src = ev.src_id;
+  key.dst = ev.dst_id;
+  key.device = ev.device_id;
+  if (isTransfer(ev.kind)) {
+    key.addr = ev.address & ~(kAddrBucket - 1);
+  }
+  uint64_t n = ev.bytes;
+  if (!isTransfer(ev.kind) && n == 0) {
+    n = 1;
+  }
   auto& c = C();
   std::lock_guard<std::mutex> lock(c.mu);
-  pushBounded(c.pending.uvm, ev);
+  c.agg[key] += n;
+  switch (ev.kind) {
+    case uvm::EventKind::kBytesHtoD:
+    case uvm::EventKind::kMemcpyHtoD:
+      c.netIn += static_cast<int64_t>(ev.bytes);
+      break;
+    case uvm::EventKind::kBytesDtoH:
+      c.netIn -= static_cast<int64_t>(ev.bytes);
+      break;
+    default:
+      break;
+  }
 }
 
 void onMemory(const CUpti_Activity* rec) {
-  const auto* m = reinterpret_cast<const CUpti_ActivityMemory4*>(rec);
+  const auto* m = reinterpret_cast<const ActivityMemory*>(rec);
   const bool managed = m->memoryKind == CUPTI_ACTIVITY_MEMORY_KIND_MANAGED ||
                        m->memoryKind == CUPTI_ACTIVITY_MEMORY_KIND_MANAGED_STATIC;
   uvm::AllocEvent ev;
@@ -372,9 +471,7 @@ void onMemcpy(const CUpti_Activity* rec) {
   ev.src_id = view.copyKind == CUPTI_ACTIVITY_MEMCPY_KIND_DTOH ? view.deviceId : kCpuId;
   ev.stream_id = view.streamId;
   ev.correlation_id = view.correlationId;
-  auto& c = C();
-  std::lock_guard<std::mutex> lock(c.mu);
-  pushBounded(c.pending.uvm, ev);
+  fold(ev);
 }
 
 void handleRecord(const CUpti_Activity* rec) {
@@ -400,13 +497,44 @@ void handleRecord(const CUpti_Activity* rec) {
   }
 }
 
-void CUPTIAPI bufferRequested(uint8_t** buffer, size_t* size, size_t* maxNumRecords) {
-  *size = kBufferBytes;
-  *maxNumRecords = 0;
-  *buffer = static_cast<uint8_t*>(std::malloc(*size));
-  if (*buffer == nullptr) {
-    *size = 0;
+void initPool() {
+  auto& c = C();
+  std::lock_guard<std::mutex> lock(c.bufMu);
+  if (c.poolReady) {
+    return;
   }
+  c.freeBufs.reserve(kPoolCap);
+  for (int i = 0; i < kPoolCap; ++i) {
+    void* p = std::malloc(kBufferBytes);
+    if (p != nullptr) {
+      c.freeBufs.push_back(static_cast<uint8_t*>(p));
+    }
+  }
+  c.poolReady = true;
+  logf("activity buffer pool %zu x %zu", c.freeBufs.size(), kBufferBytes);
+}
+
+void recycleBuffer(uint8_t* buffer) {
+  if (buffer == nullptr) {
+    return;
+  }
+  auto& c = C();
+  std::lock_guard<std::mutex> lock(c.bufMu);
+  c.freeBufs.push_back(buffer);
+}
+
+void CUPTIAPI bufferRequested(uint8_t** buffer, size_t* size, size_t* maxNumRecords) {
+  *buffer = nullptr;
+  *size = 0;
+  *maxNumRecords = 0;
+  auto& c = C();
+  std::lock_guard<std::mutex> lock(c.bufMu);
+  if (c.freeBufs.empty()) {
+    return;
+  }
+  *buffer = c.freeBufs.back();
+  c.freeBufs.pop_back();
+  *size = kBufferBytes;
 }
 
 void accountDropped(CUcontext ctx, uint32_t streamId) {
@@ -438,19 +566,45 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* buffer,
   if (buffer == nullptr) {
     return;
   }
-  if (!C().disabled.load(std::memory_order_relaxed)) {
-    CUpti_Activity* rec = nullptr;
-    for (;;) {
-      const CUptiResult st = cuptiActivityGetNextRecord(buffer, validSize, &rec);
-      if (st == CUPTI_SUCCESS) {
-        handleRecord(rec);
-        continue;
-      }
-      break;
-    }
-    accountDropped(ctx, streamId);
+  auto& c = C();
+  if (c.disabled.load(std::memory_order_relaxed)) {
+    recycleBuffer(buffer);
+    return;
   }
-  std::free(buffer);
+  Collector::Filled slot;
+  slot.data = buffer;
+  slot.valid = validSize;
+  slot.ctx = ctx;
+  slot.stream = streamId;
+  std::lock_guard<std::mutex> lock(c.bufMu);
+  c.filled.push_back(slot);
+}
+
+void drainBuffers() {
+  auto& c = C();
+  for (;;) {
+    Collector::Filled slot;
+    {
+      std::lock_guard<std::mutex> lock(c.bufMu);
+      if (c.filled.empty()) {
+        break;
+      }
+      slot = c.filled.front();
+      c.filled.pop_front();
+    }
+    if (!c.disabled.load(std::memory_order_relaxed) && slot.valid > 0) {
+      CUpti_Activity* rec = nullptr;
+      for (;;) {
+        const CUptiResult st = cuptiActivityGetNextRecord(slot.data, slot.valid, &rec);
+        if (st != CUPTI_SUCCESS) {
+          break;
+        }
+        handleRecord(rec);
+      }
+      accountDropped(slot.ctx, slot.stream);
+    }
+    recycleBuffer(slot.data);
+  }
 }
 
 using CuInitFn = CUresult (*)(unsigned int);
@@ -494,6 +648,19 @@ void fillHello() {
   if (::gethostname(host, sizeof(host)) == 0) {
     host[sizeof(host) - 1] = '\0';
     c.hello.hostname = host;
+  }
+  // Every containerized process here is pid 1. Mix in the hostname so three
+  // pods on one agent stay separate in the live view.
+  if (c.hello.pid <= 1 && !c.hello.hostname.empty()) {
+    uint32_t h = 2166136261u;
+    for (unsigned char ch : c.hello.hostname) {
+      h ^= ch;
+      h *= 16777619u;
+    }
+    if (h < 2) {
+      h += 2;
+    }
+    c.hello.pid = h;
   }
 
   void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
@@ -610,23 +777,77 @@ bool enqueueFrame(Collector& c, std::string framed, uint64_t eventCount) {
   return true;
 }
 
+void refreshManaged(Collector& c) {
+  std::ifstream in("/proc/self/maps");
+  if (!in) {
+    return;
+  }
+  const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  const uint64_t before = c.managedBytes;
+  c.managedBytes = uvm::sumNvidiaUvmMaps(text);
+  c.managedKnown = true;
+  c.hello.managed_bytes = c.managedBytes;
+  c.hello.managed_known = true;
+
+  std::lock_guard<std::mutex> lock(c.mu);
+  int64_t est = c.netIn - c.netFloor;
+  // A free leaves no eviction record. Assume the freed range was resident in
+  // the same proportion as the whole footprint.
+  if (before > 0 && c.managedBytes < before && est > 0) {
+    const double keep = static_cast<double>(c.managedBytes) / static_cast<double>(before);
+    const int64_t scaled = static_cast<int64_t>(static_cast<double>(est) * keep);
+    c.netFloor += est - scaled;
+    est = scaled;
+  }
+  if (est < 0) {
+    c.netFloor = c.netIn;
+    est = 0;
+  }
+  const int64_t cap = static_cast<int64_t>(c.managedBytes);
+  if (est > cap) {
+    c.netFloor = c.netIn - cap;
+    est = cap;
+  }
+  c.resident = static_cast<uint64_t>(est);
+  c.hello.gpu_resident_bytes = c.resident;
+}
+
 void drainPending() {
   auto& c = C();
+  refreshManaged(c);
+  // Re-send when the estimate moves by 1 MiB; smaller jitter is not worth a frame.
+  const uint64_t moved = c.resident > c.residentSent ? c.resident - c.residentSent : c.residentSent - c.resident;
+  const bool gaugeDirty =
+      c.managedKnown && (!c.managedSentValid || c.managedSent != c.managedBytes || moved >= (1u << 20));
   Pending local;
+  std::map<AggKey, uint64_t> agg;
   {
     std::lock_guard<std::mutex> lock(c.mu);
-    if (c.pending.uvm.empty() && c.pending.allocs.empty() && c.pending.kernels.empty() &&
+    if (c.agg.empty() && c.pending.uvm.empty() && c.pending.allocs.empty() && c.pending.kernels.empty() &&
         c.pending.dropped == 0) {
       std::lock_guard<std::mutex> sendLock(c.sendMu);
-      if (c.unsentDrops == 0) {
+      if (c.unsentDrops == 0 && !gaugeDirty) {
         return;
       }
     }
+    agg.swap(c.agg);
     local.uvm.swap(c.pending.uvm);
     local.allocs.swap(c.pending.allocs);
     local.kernels.swap(c.pending.kernels);
     local.dropped = c.pending.dropped;
     c.pending.dropped = 0;
+  }
+  local.uvm.reserve(local.uvm.size() + agg.size());
+  for (const auto& item : agg) {
+    uvm::UvmEvent ev;
+    ev.kind = static_cast<uvm::EventKind>(item.first.kind);
+    ev.cause = static_cast<uvm::MigrationCause>(item.first.cause);
+    ev.src_id = item.first.src;
+    ev.dst_id = item.first.dst;
+    ev.device_id = item.first.device;
+    ev.address = item.first.addr;
+    ev.bytes = item.second;
+    local.uvm.push_back(ev);
   }
   uint64_t extra = 0;
   {
@@ -636,7 +857,7 @@ void drainPending() {
   }
   local.dropped += extra;
   const uint64_t eventCount = local.uvm.size() + local.allocs.size() + local.kernels.size();
-  if (eventCount == 0 && local.dropped == 0) {
+  if (eventCount == 0 && local.dropped == 0 && !gaugeDirty) {
     return;
   }
   uvm::EventBatch batch;
@@ -644,11 +865,18 @@ void drainPending() {
   batch.allocs.swap(local.allocs);
   batch.kernels.swap(local.kernels);
   batch.dropped = local.dropped;
+  batch.managed_bytes = c.managedBytes;
+  batch.managed_known = c.managedKnown;
+  batch.gpu_resident_bytes = c.resident;
   uvm::Buf env;
   uvm::encodeBatch(env, batch);
   // On failure the whole frame is counted as dropped, including records and
   // any drop total already folded into this frame.
-  enqueueFrame(c, uvm::frame(env), eventCount + local.dropped);
+  if (enqueueFrame(c, uvm::frame(env), eventCount + local.dropped) && c.managedKnown) {
+    c.managedSent = c.managedBytes;
+    c.managedSentValid = true;
+    c.residentSent = c.resident;
+  }
 }
 
 void flushSendQueue() {
@@ -673,6 +901,8 @@ void flushSendQueue() {
   }
 }
 
+bool configureCounters(const char** why);
+
 void workerMain() {
   auto& c = C();
   // Let the driver finish InitializeInjection before touching libcuda.
@@ -680,17 +910,36 @@ void workerMain() {
   if (!c.disabled.load()) {
     fillHello();
   }
+  // Unified-memory counters return NOT_READY until a CUDA context exists.
+  // InitializeInjection runs before that, so retry from this thread.
+  bool uvmOn = false;
+  int uvmTries = 0;
+  const char* uvmWhy = "";
   while (!c.stop.load()) {
+    if (!uvmOn && !c.disabled.load() && uvmTries < 100) {
+      const char* why = "";
+      uvmOn = configureCounters(&why);
+      ++uvmTries;
+      if (uvmOn) {
+        logf("unified memory counters enabled");
+      } else if (uvmTries == 100) {
+        logf("unified memory counters unavailable: %s", why != nullptr ? why : uvmWhy);
+      } else if (why != nullptr) {
+        uvmWhy = why;
+      }
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(c.flushMs));
     if (c.disabled.load()) {
       break;
     }
     cuptiActivityFlushAll(0);
+    drainBuffers();
     drainPending();
     flushSendQueue();
   }
   if (!c.disabled.load()) {
     cuptiActivityFlushAll(0);
+    drainBuffers();
     drainPending();
     flushSendQueue();
   }
@@ -713,7 +962,7 @@ void shutdownCollector() {
   }
 }
 
-void configureCounters() {
+bool configureCounters(const char** why) {
   CUpti_ActivityUnifiedMemoryCounterConfig cfg[8];
   uint32_t n = 0;
   auto add = [&](CUpti_ActivityUnifiedMemoryCounterKind kind) {
@@ -736,16 +985,18 @@ void configureCounters() {
 
   const CUptiResult st = cuptiActivityConfigureUnifiedMemoryCounter(cfg, n);
   if (st != CUPTI_SUCCESS) {
-    logf("unified memory counters unavailable: %s", cuptiErr(st));
+    *why = cuptiErr(st);
+    return false;
   }
   const CUptiResult en = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER);
   if (en != CUPTI_SUCCESS) {
-    logf("enable unified memory activity: %s", cuptiErr(en));
+    *why = cuptiErr(en);
+    return false;
   }
+  return true;
 }
 
 void enableActivities() {
-  configureCounters();
   CUptiResult st = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMORY2);
   if (st != CUPTI_SUCCESS) {
     logf("enable MEMORY2: %s", cuptiErr(st));
@@ -795,6 +1046,7 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection() {
   }
   c.started = true;
   loadConfig();
+  initPool();
   enableActivities();
   c.worker = std::thread(workerMain);
   std::atexit(shutdownCollector);

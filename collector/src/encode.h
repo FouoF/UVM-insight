@@ -50,6 +50,9 @@ struct Hello {
   std::string cuda_version;
   std::string driver_version;
   std::vector<GpuInfo> gpus;
+  uint64_t managed_bytes = 0;
+  bool managed_known = false;
+  uint64_t gpu_resident_bytes = 0;
 };
 
 struct UvmEvent {
@@ -89,7 +92,15 @@ struct EventBatch {
   std::vector<AllocEvent> allocs;
   std::vector<KernelEvent> kernels;
   uint64_t dropped = 0;
+  uint64_t managed_bytes = 0;
+  bool managed_known = false;
+  uint64_t gpu_resident_bytes = 0;
 };
+
+// Sums the virtual size of /dev/nvidia-uvm mappings. That is the process's
+// live unified-memory footprint, including allocations made before this
+// collector attached. nvidia-uvm-tools is the profiling device, not memory.
+uint64_t sumNvidiaUvmMaps(std::string_view text);
 
 class Buf {
  public:
