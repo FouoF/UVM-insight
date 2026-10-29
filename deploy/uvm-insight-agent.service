@@ -1,0 +1,11 @@
+[Unit]
+Description=UVM Insight agent
+After=network.target
+
+[Service]
+RuntimeDirectory=uvm-insight
+ExecStart=/usr/local/bin/uvm-insight-agent --socket /run/uvm-insight/agent.sock --listen 127.0.0.1:9400 --retention 10m
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
