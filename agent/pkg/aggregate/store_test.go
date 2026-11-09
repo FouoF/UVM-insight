@@ -103,3 +103,45 @@ func TestManagedGaugeSurvivesUnknownFree(t *testing.T) {
 		t.Fatalf("unknown free changed managed to %d", got)
 	}
 }
+
+func TestPromPodLabels(t *testing.T) {
+	s := New(time.Minute)
+	calls := 0
+	s.SetPodLookup(func(uid string) (string, string, bool) {
+		calls++
+		if uid == "uid-1" && calls > 1 {
+			return "pharma", "esm2-7f9c", true
+		}
+		return "", "", false
+	})
+	s.Register(protocol.Hello{
+		PID: 4242, AppName: "esm2", Hostname: "esm2-7f9c", PodUID: "uid-1", ContainerName: "serve",
+		CuptiAPIVersion: 18, ManagedBytes: 1 << 30, ManagedKnown: true, ResidentBytes: 512 << 20,
+		GPUs: []protocol.GpuInfo{{DeviceID: 0, UUID: "GPU-61951b89"}},
+	})
+	s.Ingest(4242, protocol.EventBatch{Uvm: []protocol.UvmEvent{{
+		Kind: protocol.KindBytesHtoD, Bytes: 4096, SrcID: cpuID, DstID: 0, Cause: protocol.CauseCoherence,
+	}}})
+
+	first := s.Prom()
+	if id := first.Info[0].Ident; id.Pod != "esm2-7f9c" || id.Namespace != "" || id.Container != "serve" {
+		t.Fatalf("before resolve: %+v", id)
+	}
+	snap := s.Prom()
+	if id := snap.Info[0].Ident; id.Namespace != "pharma" || id.Pod != "esm2-7f9c" || id.PID != "4242" {
+		t.Fatalf("resolved: %+v", id)
+	}
+	if snap.Info[0].CuptiAPI != "18" {
+		t.Fatalf("cupti: %+v", snap.Info[0])
+	}
+	if len(snap.Migrated) != 1 || snap.Migrated[0].GPUUUID != "GPU-61951b89" || snap.Migrated[0].Cause != "coherence" {
+		t.Fatalf("migrated: %+v", snap.Migrated)
+	}
+	if len(snap.Resident) != 1 || snap.Resident[0].Value != float64(512<<20) {
+		t.Fatalf("resident: %+v", snap.Resident)
+	}
+	s.Prom()
+	if calls != 2 {
+		t.Fatalf("lookup after resolve: %d calls", calls)
+	}
+}

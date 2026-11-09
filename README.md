@@ -34,7 +34,9 @@ make demo
 
 ## 在 GPU 机器上采集
 
-需要 Linux、Pascal 及更新的 GPU、CUDA 12。迁移原因（页面上的颜色）需要 CUDA 12.9 及以上的 CUPTI：这一版才把 `CUpti_ActivityUnifiedMemoryCounter3` 作为统一内存计数器的记录，`flags` 里才是迁移原因。更早的工具包仍然上报字节数和缺页，原因会是「未标记」。
+需要 Linux、Pascal 及更新的 GPU、CUDA 12 的应用。
+
+采集库链接的是 `libcupti.so.12`，用的是进程里实际加载的那一份。PyTorch 这类自带 CUPTI 的镜像会在 `import torch` 时按绝对路径先加载自己的 `libcupti.so.12`，采集库会直接复用它，进程里始终只有一份 CUPTI；应用没带 CUPTI 时，才用采集库旁边那份 12.9。CUDA 12.0 到 12.9 的 CUPTI 里，采集库读到的记录字段（统一内存计数器 `Counter2`/`Counter3`、`Memory3`/`Memory4`、`Memcpy5`/`Memcpy6`、`Kernel9`）偏移都一样，迁移原因在两版计数器记录里都是 `flags`。所以不需要 `LD_PRELOAD`，也不需要替换镜像里的 CUPTI。进程实际用的 CUPTI API 版本会出现在 `uvm_process_info{cupti_api}` 里（12.1 是 18，12.9 是 28）。
 
 ```fish
 # 终端 1
@@ -77,21 +79,77 @@ cmake --build examples/build -j
 
 systemd 单元在 `deploy/uvm-insight-agent.service`，socket 放在 `/run/uvm-insight/agent.sock`。Prometheus 抓取示例在 `deploy/prometheus.yml`。
 
-agent 参数：`--socket`、`--listen`（默认 `127.0.0.1:9400`）、`--retention`（默认 `10m`）、`--mock`、`--web-dir`。要给别的机器抓指标时，把监听改成 `--listen :9400`。
+agent 参数：`--socket`、`--listen`（默认 `127.0.0.1:9400`）、`--retention`（默认 `10m`）、`--ui`（默认 `true`，`false` 时只有 `/metrics` 和 `/healthz`）、`--node-name`（默认取 `NODE_NAME`）、`--mock`、`--web-dir`。要给别的机器抓指标时，把监听改成 `--listen :9400`。`uvm-insight-agent install --src DIR --dst DIR` 把采集库装到主机目录，每个文件先写临时名再改名，正在运行、已经映射了旧库的进程不受影响。
+
+## Kubernetes 部署
+
+Helm chart 在 `deploy/helm/uvm-insight`，按 exporter 的方式部署：
+
+- **DaemonSet**，只调度到 `nvidia.com/gpu.present=true` 的节点。initContainer 把采集库装到主机的 `/var/lib/uvm-insight/lib`，exporter 在 `/var/lib/uvm-insight/agent.sock` 收事件，在 9400 端口出 `/metrics`。
+- **hostPID**：agent 通过 `SO_PEERCRED` 拿到主机 pid，`pid` 标签和 `nvidia-smi` 一致，同一节点上的多个 Pod 也不会撞号。
+- **Pod 归属**：采集库从 `/proc/self/mountinfo` 里 kubelet 挂载的路径读出 Pod UID 和容器名，exporter 用 ServiceAccount 列出本节点的 Pod，换成 `namespace`、`pod`。RBAC 只有 `pods` 的 `get`、`list`。
+- **Service** 是 headless 的，带 `prometheus.io/scrape` 注解。`serviceMonitor.enabled=true` 时生成 ServiceMonitor，`honorLabels: true`，让指标里工作负载的 `namespace`、`pod`、`container` 不被 exporter 自己的 target 标签改名成 `exported_*`。
+
+```fish
+helm upgrade --install uvm-insight deploy/helm/uvm-insight -n uvm-insight --create-namespace \
+  --set image.tag=v0.2.0-dev \
+  --set serviceMonitor.enabled=true --set serviceMonitor.labels.release=prometheus
+```
+
+`serviceMonitor.labels` 要和 Prometheus 的 `serviceMonitorSelector` 对上，kube-prometheus-stack 一般是 `release: <helm release 名>`。
+
+工作负载自己选择接入：挂上主机目录，设置 `CUDA_INJECTION64_PATH` 和 `UVMI_SOCKET`。完整片段见 `helm install` 输出的 NOTES。环境变量在进程启动时读，改了要重建 Pod。
+
+```yaml
+env:
+  - name: CUDA_INJECTION64_PATH
+    value: /var/lib/uvm-insight/lib/libuvminsight.so
+  - name: UVMI_SOCKET
+    value: /var/lib/uvm-insight/agent.sock
+volumeMounts:
+  - name: uvm-insight
+    mountPath: /var/lib/uvm-insight
+    readOnly: true
+volumes:
+  - name: uvm-insight
+    hostPath:
+      path: /var/lib/uvm-insight
+      type: Directory
+```
+
+驱动开着 `RmProfilingAdminOnly` 时，容器还要加 `SYS_ADMIN` capability，见下面「限制」。
 
 ## 指标
 
+每条序列都带 `namespace`、`pod`、`container`（不在 Kubernetes 里时为空）、`pid`、`app`。和 GPU 相关的序列还有 `gpu`（进程内的设备序号，HAMi 下每个容器都是 `gpu0`）和 `gpu_uuid`（和 dcgm-exporter、`nvidia-smi` 对得上）。
+
 | 指标 | 含义 |
 |---|---|
-| `uvm_migrated_bytes_total{pid,app,gpu,direction,cause}` | 统一内存迁移的字节。`direction` 是 `htod` / `dtoh` / `dtod` |
+| `uvm_process_info{cupti_api,driver_version}` | 正在上报的 CUDA 进程，值恒为 1。`cupti_api` 是进程里实际加载的 CUPTI API 版本 |
+| `uvm_migrated_bytes_total{direction,cause}` | 统一内存迁移的字节。`direction` 是 `htod` / `dtoh` / `dtod`，`cause` 是迁移原因 |
 | `uvm_migration_duration_seconds` | 迁移耗时直方图 |
-| `uvm_page_faults_total{pid,app,gpu,side}` | 缺页。`side` 是 `cpu` 或 `gpu` |
+| `uvm_page_faults_total{side}` | 缺页。`side` 是 `cpu` 或 `gpu` |
 | `uvm_thrashing_events_total` | 抖动 |
 | `uvm_throttling_events_total` | 节流 |
 | `uvm_remote_map_events_total` | remote map |
 | `uvm_explicit_copy_bytes_total` | 显式拷贝的字节 |
-| `uvm_managed_allocated_bytes` | 当前 `cudaMallocManaged` 还没释放的字节 |
+| `uvm_managed_allocated_bytes` | 进程 `/dev/nvidia-uvm` 映射的虚拟大小，也就是托管内存的总量 |
+| `uvm_gpu_resident_bytes` | 托管内存里估计在显存上的部分：迁入减迁回，限制在 0 和托管总量之间。首次在 GPU 上写入的页没有迁移记录，所以是估算 |
 | `uvm_collector_dropped_events_total` | 采集端来不及送出而丢掉的事件 |
+
+几条常用查询：
+
+```promql
+# 每个 Pod 的迁入/迁回带宽
+sum by (namespace, pod, direction) (rate(uvm_migrated_bytes_total[1m]))
+
+# 驱逐引起的迁回占比，超分时这个值高说明显存不够用
+sum by (pod) (rate(uvm_migrated_bytes_total{direction="dtoh",cause="eviction"}[5m]))
+  / sum by (pod) (rate(uvm_migrated_bytes_total{direction="dtoh"}[5m]))
+
+# 每张卡上各 Pod 的估算驻留
+sum by (gpu_uuid, pod) (uvm_gpu_resident_bytes)
+```
 
 HTTP：
 
@@ -110,13 +168,12 @@ HTTP：
 make image
 ```
 
-镜像名默认是 `dynamia-ai-registry.cn-hangzhou.cr.aliyuncs.com/artifacts/dynamia-ai/uvm-insight:dev`。基础镜像是 `nvidia/cuda:12.9.1`。容器里：
+镜像名默认是 `dynamia-ai-registry.cn-hangzhou.cr.aliyuncs.com/artifacts/dynamia-ai/uvm-insight:dev`，`make image TAG=v0.2.0-dev` 换标签，`make push` 推送。采集库在 Ubuntu 20.04（glibc 2.31）上编译，CUPTI 12.9 的头文件和库取自 NVIDIA 发布在 PyPI 上的 wheel，运行镜像是 distroless。容器里：
 
 - `/usr/local/bin/uvm-insight-agent`
-- `/opt/uvm-insight/lib/libuvminsight.so`（旁边有 CUPTI）
-- `/opt/uvm-insight/examples/`
+- `/opt/uvm-insight/lib/libuvminsight.so`，旁边是 CUPTI 12.9 的 `libcupti.so.12` 和 `libnvperf_*`
 
-跑应用的容器需要同一个 `libuvminsight.so`，并且能连上 agent 的 socket。同一台机器上把 socket 目录挂进去即可。
+示例程序要用 nvcc 编译，不在镜像里，用 `make examples` 在 GPU 机器上构建。
 
 ## 限制
 
@@ -124,7 +181,9 @@ CUPTI 的 activity 有开销。`UVMI_FLUSH_MS` 调大，事件会更晚到页面
 
 统一内存计数器在 WSL、MPS，以及一部分 vGPU 上会不可用或者只有一部分计数器有数。注入库遇到这种情况会在 stderr 写一行，然后继续记内存分配和 kernel。
 
-**注意：** 驱动如果把 profiling 限制成管理员（`NVreg_RestrictProfilingToAdminUsers=1`），普通用户的 CUPTI 会被拒绝。需要在内核模块参数里改成 `NVreg_RestrictProfilingToAdminUsers=0` 并重新加载驱动。这会放宽谁可以做 GPU profiling。
+**注意：** 驱动如果把 profiling 限制成管理员（`NVreg_RestrictProfilingToAdminUsers=1`，`/proc/driver/nvidia/params` 里是 `RmProfilingAdminOnly: 1`），普通用户的 CUPTI 会被拒绝。两种办法：给接入的容器加 `SYS_ADMIN` capability，这个权限很大；或者在内核模块参数里改成 `NVreg_RestrictProfilingToAdminUsers=0` 并重新加载驱动，这会放宽节点上谁可以做 GPU profiling。
+
+采集库只支持 CUDA 12（`libcupti.so.12`）。CUDA 13 的应用会加载 `libcupti.so.13`，和 `.so.12` 是两个库，需要另外用 CUDA 13 的 CUPTI 编一份采集库，按应用的 CUDA 大版本选择 `CUDA_INJECTION64_PATH`。
 
 **注意：** agent 把 socket 和它所在的目录设成了 `0777`，这样别的用户的 CUDA 进程也能连上来。任何本机进程都可以往这个 socket 里写事件。多人共用的机器上，把 `--socket` 指到一个权限更紧的目录。
 

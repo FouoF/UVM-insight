@@ -101,7 +101,64 @@ void encodeHello(Buf& envelope, const Hello& hello) {
     body.varint(9, 1);
   }
   body.varint(10, hello.gpu_resident_bytes);
+  body.str(11, hello.pod_uid);
+  body.str(12, hello.container_name);
+  body.varint(13, hello.cupti_api_version);
   envelope.msg(1, body);
+}
+
+bool parseKubeletMounts(std::string_view mountinfo, std::string* podUid, std::string* container) {
+  constexpr std::string_view kPods = "/pods/";
+  constexpr std::string_view kContainers = "/containers/";
+  bool found = false;
+  size_t i = 0;
+  while (i < mountinfo.size()) {
+    size_t eol = mountinfo.find('\n', i);
+    if (eol == std::string_view::npos) {
+      eol = mountinfo.size();
+    }
+    const std::string_view line = mountinfo.substr(i, eol - i);
+    i = eol < mountinfo.size() ? eol + 1 : mountinfo.size();
+    // Field 4 is the root of the mount within its filesystem.
+    size_t pos = 0;
+    for (int f = 0; f < 3 && pos != std::string_view::npos; ++f) {
+      pos = line.find(' ', pos);
+      if (pos != std::string_view::npos) {
+        ++pos;
+      }
+    }
+    if (pos == std::string_view::npos) {
+      continue;
+    }
+    const size_t rootEnd = line.find(' ', pos);
+    const std::string_view root = line.substr(pos, rootEnd == std::string_view::npos ? std::string_view::npos : rootEnd - pos);
+    const size_t p = root.find(kPods);
+    if (p == std::string_view::npos) {
+      continue;
+    }
+    const std::string_view rest = root.substr(p + kPods.size());
+    const size_t slash = rest.find('/');
+    const std::string_view uid = rest.substr(0, slash);
+    // Pod UIDs are RFC 4122 strings: 36 characters with four dashes.
+    if (uid.size() != 36 || uid[8] != '-' || uid[13] != '-' || uid[18] != '-' || uid[23] != '-') {
+      continue;
+    }
+    if (!found) {
+      podUid->assign(uid);
+      found = true;
+    }
+    if (slash == std::string_view::npos) {
+      continue;
+    }
+    const std::string_view tail = rest.substr(slash);
+    if (tail.rfind(kContainers, 0) == 0) {
+      const std::string_view name = tail.substr(kContainers.size(), tail.find('/', kContainers.size()) - kContainers.size());
+      if (!name.empty() && container->empty()) {
+        container->assign(name);
+      }
+    }
+  }
+  return found;
 }
 
 bool parseHex(std::string_view s, uint64_t* out) {

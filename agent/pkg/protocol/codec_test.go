@@ -25,8 +25,11 @@ func TestCppFixture(t *testing.T) {
 	if h.PID != 42 || h.Comm != "vec" || h.AppName != "vecAdd" || h.Hostname != "n1" {
 		t.Fatalf("hello identity: %+v", h)
 	}
-	if h.CudaVersion != "12.8" || h.DriverVersion != "12.8" {
+	if h.CudaVersion != "12.8" || h.DriverVersion != "12.8" || h.CuptiAPIVersion != 18 {
 		t.Fatalf("versions: %+v", h)
+	}
+	if h.PodUID != "0f4c2a51-7d8e-4b9a-9c1d-2e3f4a5b6c7d" || h.ContainerName != "serve" {
+		t.Fatalf("pod identity: %+v", h)
 	}
 	if len(h.GPUs) != 1 || h.GPUs[0].Name != "A100" || h.GPUs[0].UUID != "GPU-abc" || h.GPUs[0].TotalMemoryBytes != 80<<30 {
 		t.Fatalf("gpu: %+v", h.GPUs)

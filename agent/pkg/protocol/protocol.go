@@ -49,6 +49,10 @@ type Hello struct {
 	ManagedBytes  uint64
 	ManagedKnown  bool
 	ResidentBytes uint64
+	// Empty outside Kubernetes.
+	PodUID          string
+	ContainerName   string
+	CuptiAPIVersion uint32
 }
 
 type UvmEvent struct {

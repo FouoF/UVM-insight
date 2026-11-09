@@ -34,6 +34,12 @@ message Hello {
   bool managed_known = 9;
   // Estimated part of managed_bytes resident on the GPU. Valid with managed_known.
   uint64 gpu_resident_bytes = 10;
+  // Kubernetes pod UID and container name, read from the kubelet mounts in
+  // /proc/self/mountinfo. Empty outside Kubernetes.
+  string pod_uid = 11;
+  string container_name = 12;
+  // cuptiGetVersion() of the libcupti loaded in this process.
+  uint32 cupti_api_version = 13;
 }
 
 message GpuInfo {

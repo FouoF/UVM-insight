@@ -1,7 +1,7 @@
 IMAGE ?= dynamia-ai-registry.cn-hangzhou.cr.aliyuncs.com/artifacts/dynamia-ai/uvm-insight
 TAG ?= dev
 
-.PHONY: all web agent test demo collector examples image
+.PHONY: all web agent test demo collector examples image push chart
 
 all: agent
 
@@ -33,3 +33,10 @@ examples:
 
 image:
 	docker buildx build --platform linux/amd64 -f deploy/Dockerfile -t $(IMAGE):$(TAG) --load .
+
+push: image
+	docker push $(IMAGE):$(TAG)
+
+chart:
+	helm lint deploy/helm/uvm-insight
+	helm template uvm-insight deploy/helm/uvm-insight --set serviceMonitor.enabled=true > /dev/null

@@ -29,6 +29,9 @@ int main(int argc, char** argv) {
   gpu.name = "A100";
   gpu.total_memory_bytes = 80ull << 30;
   hello.gpus.push_back(gpu);
+  hello.pod_uid = "0f4c2a51-7d8e-4b9a-9c1d-2e3f4a5b6c7d";
+  hello.container_name = "serve";
+  hello.cupti_api_version = 18;
   uvm::encodeHello(helloEnv, hello);
   const std::string helloFrame = uvm::frame(helloEnv);
 
@@ -90,6 +93,23 @@ int main(int argc, char** argv) {
       "7f3000000000-7f3000002000 rw-s 00000000 00:00 0 /dev/nvidia-uvm\n";
   if (uvm::sumNvidiaUvmMaps(maps) != (0x200000ull + 0x2000ull)) {
     return fail("uvm map sum");
+  }
+
+  const char* mountinfo =
+      "830 829 0:52 / / rw,relatime master:1 - overlay overlay rw\n"
+      "841 830 253:0 /var/lib/kubelet/pods/0f4c2a51-7d8e-4b9a-9c1d-2e3f4a5b6c7d/etc-hosts /etc/hosts rw - ext4 /dev/vda1 rw\n"
+      "842 830 253:0 /var/lib/kubelet/pods/0f4c2a51-7d8e-4b9a-9c1d-2e3f4a5b6c7d/containers/serve/8d1e2f3a "
+      "/dev/termination-log rw - ext4 /dev/vda1 rw\n";
+  std::string podUid;
+  std::string container;
+  if (!uvm::parseKubeletMounts(mountinfo, &podUid, &container) ||
+      podUid != "0f4c2a51-7d8e-4b9a-9c1d-2e3f4a5b6c7d" || container != "serve") {
+    return fail("kubelet mounts");
+  }
+  podUid.clear();
+  container.clear();
+  if (uvm::parseKubeletMounts("25 1 0:22 / /proc rw - proc proc rw\n", &podUid, &container)) {
+    return fail("kubelet mounts outside a pod");
   }
 
   const char* path = argc > 1 ? argv[1] : "proto/testdata/sample.frames";

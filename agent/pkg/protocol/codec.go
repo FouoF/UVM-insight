@@ -65,6 +65,9 @@ func encodeHello(h Hello) []byte {
 		b = appendVarintField(b, 9, 1)
 	}
 	b = appendVarintField(b, 10, h.ResidentBytes)
+	b = appendString(b, 11, h.PodUID)
+	b = appendString(b, 12, h.ContainerName)
+	b = appendVarintField(b, 13, uint64(h.CuptiAPIVersion))
 	return b
 }
 
@@ -262,6 +265,14 @@ func decodeHello(b []byte) (Hello, error) {
 			h.ManagedKnown = v != 0
 		case 10:
 			h.ResidentBytes, i, err = readVarint(b, i)
+		case 11:
+			h.PodUID, i, err = readString(b, i)
+		case 12:
+			h.ContainerName, i, err = readString(b, i)
+		case 13:
+			var v uint64
+			v, i, err = readVarint(b, i)
+			h.CuptiAPIVersion = uint32(v)
 		default:
 			i, err = skip(b, i, wire)
 		}

@@ -26,13 +26,3 @@ set_target_properties(uvminsight PROPERTIES
   BUILD_RPATH "\$ORIGIN"
   INSTALL_RPATH "\$ORIGIN"
 )
-
-# CUDA 12.9 documents CUpti_ActivityUnifiedMemoryCounter3 as the record emitted
-# for CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER. That record's flags field is
-# the migration cause. Older toolkits document Counter2, which is a shorter
-# prefix, so flags are only read on 12.9+ unless the builder overrides this.
-if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.9)
-  target_compile_definitions(uvminsight PRIVATE UVMI_READ_UM_FLAGS=1)
-else()
-  target_compile_definitions(uvminsight PRIVATE UVMI_READ_UM_FLAGS=0)
-endif()

@@ -45,6 +45,7 @@ func Serve(ctx context.Context, path string, st *aggregate.Store) error {
 
 func handle(conn net.Conn, st *aggregate.Store) {
 	defer conn.Close()
+	host := peerPID(conn)
 	var pid uint32
 	var seen bool
 	defer func() {
@@ -58,6 +59,11 @@ func handle(conn net.Conn, st *aggregate.Store) {
 			return
 		}
 		if env.Hello != nil {
+			// A pid from the agent's own namespace is unique on the node and
+			// matches nvidia-smi. The collector's value is only a fallback.
+			if host > 1 {
+				env.Hello.PID = host
+			}
 			pid = env.Hello.PID
 			seen = true
 			st.Register(*env.Hello)

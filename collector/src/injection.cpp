@@ -1,9 +1,5 @@
 #include "encode.h"
 
-#ifndef UVMI_READ_UM_FLAGS
-#define UVMI_READ_UM_FLAGS 0
-#endif
-
 #include <cupti.h>
 
 #include <cuda.h>
@@ -94,32 +90,37 @@ struct MemcpyPrefix {
   uint32_t runtimeCorrelationId;
 } __attribute__((packed));
 
+// The record struct a kind emits is chosen by the libcupti loaded at run
+// time, which is often the copy bundled with PyTorch rather than the one this
+// library was built against. Across CUDA 12.0-12.9 the newer records only
+// append fields, so the prefixes below are read from whichever record arrives:
+//   UNIFIED_MEMORY_COUNTER  Counter2 (<12.8), Counter3 (12.8+)
+//   MEMORY2                 Memory3 (<12.6), Memory4 (12.6+)
+//   MEMCPY                  Memcpy5 (<12.8), Memcpy6 (12.8+)
+//   CONCURRENT_KERNEL       Kernel9
+// In both counter records flags carries the migration cause for transfers.
 static_assert(offsetof(CUpti_ActivityUnifiedMemoryCounter2, address) == offsetof(UmView, address),
               "unified memory counter prefix drifted");
-// Current toolkits emit CUpti_ActivityMemory4 for MEMORY2. CUDA 12.1 still
-// defines Memory3. The fields this collector reads exist on both records.
-#if CUDA_VERSION >= 12030
-using ActivityMemory = CUpti_ActivityMemory4;
-#else
-using ActivityMemory = CUpti_ActivityMemory3;
-#endif
-static_assert(offsetof(ActivityMemory, bytes) > 0, "memory record");
-static_assert(offsetof(CUpti_ActivityKernel9, name) > 0, "kernel record");
-
-#if UVMI_READ_UM_FLAGS
-static_assert(offsetof(CUpti_ActivityUnifiedMemoryCounter3, flags) == offsetof(UmView, flags),
+static_assert(offsetof(CUpti_ActivityUnifiedMemoryCounter2, flags) == offsetof(UmView, flags),
               "unified memory counter flags drifted");
-#endif
-
-#if CUDA_VERSION >= 12080
-static_assert(offsetof(CUpti_ActivityMemcpy6, bytes) == offsetof(MemcpyPrefix, bytes), "memcpy prefix");
-static_assert(offsetof(CUpti_ActivityMemcpy6, correlationId) == offsetof(MemcpyPrefix, correlationId),
-              "memcpy correlation");
-#else
 static_assert(offsetof(CUpti_ActivityMemcpy5, bytes) == offsetof(MemcpyPrefix, bytes), "memcpy prefix");
 static_assert(offsetof(CUpti_ActivityMemcpy5, correlationId) == offsetof(MemcpyPrefix, correlationId),
               "memcpy correlation");
+#if CUPTI_API_VERSION >= 26
+static_assert(offsetof(CUpti_ActivityUnifiedMemoryCounter3, flags) == offsetof(UmView, flags),
+              "unified memory counter flags drifted");
+static_assert(offsetof(CUpti_ActivityMemcpy6, correlationId) == offsetof(MemcpyPrefix, correlationId),
+              "memcpy correlation");
 #endif
+using ActivityMemory = CUpti_ActivityMemory3;
+#if CUPTI_API_VERSION >= 24
+static_assert(offsetof(CUpti_ActivityMemory4, deviceId) == offsetof(ActivityMemory, deviceId), "memory record");
+static_assert(offsetof(CUpti_ActivityMemory4, timestamp) == offsetof(ActivityMemory, timestamp), "memory record");
+#endif
+static_assert(offsetof(CUpti_ActivityKernel9, name) > 0, "kernel record");
+
+// CUPTI 12.0 reports API version 17. Older libraries emit different records.
+constexpr uint32_t kMinCuptiApi = 17;
 
 struct Pending {
   std::vector<uvm::UvmEvent> uvm;
@@ -299,11 +300,7 @@ void fold(const uvm::UvmEvent& ev);
 
 void onUnified(const CUpti_Activity* rec) {
   UmView view{};
-  size_t n = offsetof(UmView, flags);
-#if UVMI_READ_UM_FLAGS
-  n = offsetof(UmView, pad);
-#endif
-  std::memcpy(&view, rec, n);
+  std::memcpy(&view, rec, offsetof(UmView, pad));
 
   uvm::UvmEvent ev;
   ev.start_ns = view.start;
@@ -318,27 +315,21 @@ void onUnified(const CUpti_Activity* rec) {
     case CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_BYTES_TRANSFER_HTOD:
       ev.kind = uvm::EventKind::kBytesHtoD;
       ev.bytes = view.value;
-#if UVMI_READ_UM_FLAGS
       ev.cause = mapCause(view.flags);
-#endif
       break;
     case CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_BYTES_TRANSFER_DTOH:
       ev.kind = uvm::EventKind::kBytesDtoH;
       ev.bytes = view.value;
-#if UVMI_READ_UM_FLAGS
       ev.cause = mapCause(view.flags);
-#endif
       break;
 #ifdef CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_BYTES_TRANSFER_DTOD
     case CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_BYTES_TRANSFER_DTOD:
       ev.kind = uvm::EventKind::kBytesDtoD;
       ev.bytes = view.value;
       ev.device_id = view.dstId;
-#if UVMI_READ_UM_FLAGS
       if (view.flags <= CUPTI_ACTIVITY_UNIFIED_MEMORY_MIGRATION_CAUSE_ACCESS_COUNTERS) {
         ev.cause = mapCause(view.flags);
       }
-#endif
       break;
 #endif
     case CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_CPU_PAGE_FAULT_COUNT:
@@ -632,7 +623,9 @@ std::string versionString(int packed) {
 
 void fillHello() {
   auto& c = C();
+  const uint32_t api = c.hello.cupti_api_version;
   c.hello = uvm::Hello{};
+  c.hello.cupti_api_version = api;
   c.hello.pid = static_cast<uint32_t>(::getpid());
   c.hello.comm = readTokenFile("/proc/self/comm");
   const char* app = std::getenv("UVMI_APP_NAME");
@@ -649,8 +642,16 @@ void fillHello() {
     host[sizeof(host) - 1] = '\0';
     c.hello.hostname = host;
   }
-  // Every containerized process here is pid 1. Mix in the hostname so three
-  // pods on one agent stay separate in the live view.
+  {
+    std::ifstream in("/proc/self/mountinfo");
+    if (in) {
+      const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      uvm::parseKubeletMounts(text, &c.hello.pod_uid, &c.hello.container_name);
+    }
+  }
+  // An agent outside the host pid namespace cannot see the real pid, and
+  // containerized processes are often pid 1. Mix in the hostname so pods
+  // sharing one agent stay separate.
   if (c.hello.pid <= 1 && !c.hello.hostname.empty()) {
     uint32_t h = 2166136261u;
     for (unsigned char ch : c.hello.hostname) {
@@ -1046,6 +1047,18 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjection() {
   }
   c.started = true;
   loadConfig();
+  uint32_t api = 0;
+  cuptiGetVersion(&api);
+  c.hello.cupti_api_version = api;
+  if (api < kMinCuptiApi) {
+    logf("libcupti API version %u is older than CUDA 12.0; collector disabled", api);
+    c.disabled.store(true);
+    return 1;
+  }
+  Dl_info where{};
+  if (dladdr(reinterpret_cast<void*>(&cuptiGetVersion), &where) != 0 && where.dli_fname != nullptr) {
+    logf("using %s (CUPTI API %u)", where.dli_fname, api);
+  }
   initPool();
   enableActivities();
   c.worker = std::thread(workerMain);

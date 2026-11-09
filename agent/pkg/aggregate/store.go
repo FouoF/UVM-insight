@@ -24,6 +24,16 @@ type Store struct {
 	now       func() time.Time
 	procs     map[uint32]*proc
 	seq       uint64
+	pods      PodLookup
+}
+
+// PodLookup resolves a pod UID to its namespace and name without blocking.
+type PodLookup func(uid string) (namespace, name string, ok bool)
+
+func (s *Store) SetPodLookup(fn PodLookup) {
+	s.mu.Lock()
+	s.pods = fn
+	s.mu.Unlock()
 }
 
 func New(retention time.Duration) *Store {
@@ -106,6 +116,9 @@ func (s *Store) registerLocked(h protocol.Hello, at time.Time) {
 		p = newProc(&s.seq)
 		s.procs[h.PID] = p
 	}
+	if p.hello.PodUID != h.PodUID {
+		p.podNamespace, p.podName = "", ""
+	}
 	p.hello = h
 	if p.hello.AppName == "" {
 		p.hello.AppName = h.Comm
@@ -181,6 +194,9 @@ type proc struct {
 	hists        map[seriesKey]*histogram
 	offsetSet    bool
 	offset       int64
+	// Kept once resolved, so series keep their labels after the pod is deleted.
+	podNamespace string
+	podName      string
 }
 
 func newProc(seq *uint64) *proc {
@@ -1083,19 +1099,32 @@ func addPoint(dst *Point, src Point) {
 
 // Prometheus export ----------------------------------------------------------
 
+// Ident labels every series of one process.
+type Ident struct {
+	Namespace, Pod, Container, PID, App string
+}
+
 type CounterObs struct {
-	PID, App, GPU, Direction, Cause, Side string
-	Value                                 float64
+	Ident
+	GPU, GPUUUID, Direction, Cause, Side string
+	Value                                float64
 }
 
 type HistObs struct {
-	PID, App, GPU, Direction, Cause string
-	Count                           uint64
-	Sum                             float64
-	Buckets                         map[float64]uint64
+	Ident
+	GPU, GPUUUID, Direction, Cause string
+	Count                          uint64
+	Sum                            float64
+	Buckets                        map[float64]uint64
+}
+
+type InfoObs struct {
+	Ident
+	CuptiAPI, Driver string
 }
 
 type PromSnap struct {
+	Info      []InfoObs
 	Migrated  []CounterObs
 	Explicit  []CounterObs
 	Faults    []CounterObs
@@ -1103,8 +1132,40 @@ type PromSnap struct {
 	Throttle  []CounterObs
 	Remote    []CounterObs
 	Managed   []CounterObs
+	Resident  []CounterObs
 	Dropped   []CounterObs
 	Durations []HistObs
+}
+
+func (s *Store) identLocked(p *proc) Ident {
+	id := Ident{
+		Container: p.hello.ContainerName,
+		PID:       fmt.Sprintf("%d", p.hello.PID),
+		App:       p.app(),
+	}
+	if p.hello.PodUID == "" {
+		return id
+	}
+	if p.podName == "" && s.pods != nil {
+		if ns, name, ok := s.pods(p.hello.PodUID); ok {
+			p.podNamespace, p.podName = ns, name
+		}
+	}
+	id.Namespace, id.Pod = p.podNamespace, p.podName
+	if id.Pod == "" {
+		// Kubernetes sets the pod hostname to the pod name unless spec.hostname overrides it.
+		id.Pod = p.hello.Hostname
+	}
+	return id
+}
+
+func (p *proc) gpuUUID(gpu string) string {
+	for _, g := range p.hello.GPUs {
+		if gpuName(g.DeviceID) == gpu {
+			return g.UUID
+		}
+	}
+	return ""
 }
 
 func (s *Store) Prom() PromSnap {
@@ -1112,31 +1173,38 @@ func (s *Store) Prom() PromSnap {
 	defer s.mu.Unlock()
 	var snap PromSnap
 	for _, p := range s.procs {
-		pid := fmt.Sprintf("%d", p.hello.PID)
-		app := p.app()
+		id := s.identLocked(p)
+		cupti := ""
+		if p.hello.CuptiAPIVersion > 0 {
+			cupti = fmt.Sprintf("%d", p.hello.CuptiAPIVersion)
+		}
+		snap.Info = append(snap.Info, InfoObs{Ident: id, CuptiAPI: cupti, Driver: p.hello.DriverVersion})
 		for k, v := range p.migrated {
-			snap.Migrated = append(snap.Migrated, CounterObs{PID: pid, App: app, GPU: k.gpu, Direction: k.direction, Cause: k.cause, Value: float64(v)})
+			snap.Migrated = append(snap.Migrated, CounterObs{Ident: id, GPU: k.gpu, GPUUUID: p.gpuUUID(k.gpu), Direction: k.direction, Cause: k.cause, Value: float64(v)})
 		}
 		for k, v := range p.explicit {
-			snap.Explicit = append(snap.Explicit, CounterObs{PID: pid, App: app, GPU: k.gpu, Direction: k.direction, Cause: k.cause, Value: float64(v)})
+			snap.Explicit = append(snap.Explicit, CounterObs{Ident: id, GPU: k.gpu, GPUUUID: p.gpuUUID(k.gpu), Direction: k.direction, Cause: k.cause, Value: float64(v)})
 		}
 		for k, v := range p.faults {
-			snap.Faults = append(snap.Faults, CounterObs{PID: pid, App: app, GPU: k.gpu, Side: k.side, Value: float64(v)})
+			snap.Faults = append(snap.Faults, CounterObs{Ident: id, GPU: k.gpu, GPUUUID: p.gpuUUID(k.gpu), Side: k.side, Value: float64(v)})
 		}
 		for k, v := range p.thrash {
-			snap.Thrash = append(snap.Thrash, CounterObs{PID: pid, App: app, GPU: k.gpu, Value: float64(v)})
+			snap.Thrash = append(snap.Thrash, CounterObs{Ident: id, GPU: k.gpu, GPUUUID: p.gpuUUID(k.gpu), Value: float64(v)})
 		}
 		for k, v := range p.throttle {
-			snap.Throttle = append(snap.Throttle, CounterObs{PID: pid, App: app, GPU: k.gpu, Value: float64(v)})
+			snap.Throttle = append(snap.Throttle, CounterObs{Ident: id, GPU: k.gpu, GPUUUID: p.gpuUUID(k.gpu), Value: float64(v)})
 		}
 		for k, v := range p.remote {
-			snap.Remote = append(snap.Remote, CounterObs{PID: pid, App: app, GPU: k.gpu, Value: float64(v)})
+			snap.Remote = append(snap.Remote, CounterObs{Ident: id, GPU: k.gpu, GPUUUID: p.gpuUUID(k.gpu), Value: float64(v)})
 		}
-		snap.Managed = append(snap.Managed, CounterObs{PID: pid, App: app, Value: float64(p.managed)})
-		snap.Dropped = append(snap.Dropped, CounterObs{PID: pid, App: app, Value: float64(p.dropped)})
+		snap.Managed = append(snap.Managed, CounterObs{Ident: id, Value: float64(p.managed)})
+		if p.managedKnown {
+			snap.Resident = append(snap.Resident, CounterObs{Ident: id, Value: float64(p.resident)})
+		}
+		snap.Dropped = append(snap.Dropped, CounterObs{Ident: id, Value: float64(p.dropped)})
 		for k, h := range p.hists {
 			snap.Durations = append(snap.Durations, HistObs{
-				PID: pid, App: app, GPU: k.gpu, Direction: k.direction, Cause: k.cause,
+				Ident: id, GPU: k.gpu, GPUUUID: p.gpuUUID(k.gpu), Direction: k.direction, Cause: k.cause,
 				Count: h.count, Sum: h.sum, Buckets: h.cumulative(),
 			})
 		}

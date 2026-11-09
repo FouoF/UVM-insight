@@ -12,17 +12,35 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/FouoF/UVM-insight/agent/pkg/aggregate"
 	"github.com/FouoF/UVM-insight/agent/pkg/metrics"
 )
 
-func Handler(st *aggregate.Store, web fs.FS) http.Handler {
+// MetricsHandler serves only /metrics and /healthz.
+func MetricsHandler(st *aggregate.Store) http.Handler {
 	mux := http.NewServeMux()
+	addMetrics(mux, st)
+	return mux
+}
+
+func addMetrics(mux *http.ServeMux, st *aggregate.Store) {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(metrics.New(st))
+	reg.MustRegister(collectors.NewGoCollector())
+	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok\n"))
+	})
+}
+
+// Handler serves /metrics, the JSON and WebSocket API, and the web UI.
+func Handler(st *aggregate.Store, web fs.FS) http.Handler {
+	mux := http.NewServeMux()
+	addMetrics(mux, st)
 	mux.HandleFunc("GET /api/processes", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, st.Processes())
 	})

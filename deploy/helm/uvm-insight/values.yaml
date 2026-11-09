@@ -1,0 +1,54 @@
+image:
+  repository: dynamia-ai-registry.cn-hangzhou.cr.aliyuncs.com/artifacts/dynamia-ai/uvm-insight
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Host directory shared with CUDA workloads. The exporter installs the
+# collector into <hostDir>/lib and listens on <hostDir>/agent.sock.
+# Workloads mount it at the same path inside the container (see NOTES.txt).
+hostDir: /var/lib/uvm-insight
+
+# Run in the host pid namespace so the pid label is the host pid, matching
+# nvidia-smi and unique across pods on the node.
+hostPID: true
+
+# Serve the web UI and JSON API next to /metrics.
+ui:
+  enabled: false
+
+# How long exited processes keep their series.
+retention: 10m
+
+nodeSelector:
+  nvidia.com/gpu.present: "true"
+
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 512Mi
+
+podAnnotations: {}
+podLabels: {}
+
+service:
+  port: 9400
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9400"
+
+serviceMonitor:
+  enabled: false
+  # Extra labels, e.g. release: prometheus for kube-prometheus-stack.
+  labels: {}
+  interval: 15s
+  scrapeTimeout: 10s
+  # Workload namespace/pod/container labels win over the exporter's own target labels.
+  honorLabels: true

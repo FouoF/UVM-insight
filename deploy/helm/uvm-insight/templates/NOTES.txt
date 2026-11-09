@@ -1,0 +1,33 @@
+uvm-insight exporter runs on nodes matching {{ toJson .Values.nodeSelector }}.
+
+Metrics:
+  kubectl -n {{ .Release.Namespace }} port-forward ds/{{ include "uvm-insight.fullname" . }} {{ .Values.service.port }}
+  curl -s localhost:{{ .Values.service.port }}/metrics | grep ^uvm_
+
+The collector is installed on each node at {{ .Values.hostDir }}/lib. A CUDA
+workload opts in by mounting that directory and setting two variables:
+
+  spec:
+    containers:
+      - name: app
+        env:
+          - name: CUDA_INJECTION64_PATH
+            value: {{ .Values.hostDir }}/lib/libuvminsight.so
+          - name: UVMI_SOCKET
+            value: {{ .Values.hostDir }}/agent.sock
+        securityContext:
+          capabilities:
+            add: ["SYS_ADMIN"]   # only when the driver restricts profiling to admins
+        volumeMounts:
+          - name: uvm-insight
+            mountPath: {{ .Values.hostDir }}
+            readOnly: true
+    volumes:
+      - name: uvm-insight
+        hostPath:
+          path: {{ .Values.hostDir }}
+          type: Directory
+
+The variables must be present when the process starts; changing them requires
+a pod restart. PyTorch images that bundle their own libcupti work as is: the
+collector uses whichever libcupti.so.12 the process has loaded.
