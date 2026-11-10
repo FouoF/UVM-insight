@@ -52,3 +52,35 @@ serviceMonitor:
   scrapeTimeout: 10s
   # Workload namespace/pod/container labels win over the exporter's own target labels.
   honorLabels: true
+
+# Mutating admission webhook that injects CUDA_INJECTION64_PATH, the hostPath
+# mount and SYS_ADMIN into matching Pods. The DaemonSet still only installs
+# the collector and exports metrics; this webhook is what opts workloads in.
+webhook:
+  enabled: true
+  replicaCount: 1
+  # Ignore keeps the cluster usable if the webhook is down.
+  failurePolicy: Ignore
+  timeoutSeconds: 10
+  # Inside the workload container. Defaults to hostDir.
+  mountPath: ""
+  addSysAdmin: true
+  # Inject when a container requests any of these resources.
+  gpuResources:
+    - nvidia.com/gpu
+  # Also inject when the pod has nvidia.com/use-gpuuuid (HAMi / Kantaloupe).
+  injectOnHAMi: true
+  # Extra namespaces to skip (the release namespace is always skipped).
+  ignoreNamespaces:
+    - kube-system
+    - kube-public
+    - kube-node-lease
+  # Optional selectors on the MutatingWebhookConfiguration.
+  namespaceSelector: {}
+  objectSelector: {}
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      memory: 128Mi

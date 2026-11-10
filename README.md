@@ -86,6 +86,7 @@ agent 参数：`--socket`、`--listen`（默认 `127.0.0.1:9400`）、`--retenti
 Helm chart 在 `deploy/helm/uvm-insight`，按 exporter 的方式部署：
 
 - **DaemonSet**，只调度到 `nvidia.com/gpu.present=true` 的节点。initContainer 把采集库装到主机的 `/var/lib/uvm-insight/lib`，exporter 在 `/var/lib/uvm-insight/agent.sock` 收事件，在 9400 端口出 `/metrics`。
+- **Mutating Webhook**（默认开启）：给匹配的新建 Pod 自动加上 `CUDA_INJECTION64_PATH`、`UVMI_SOCKET`、hostPath 挂载和 `SYS_ADMIN`。DaemonSet 本身不做注入；webhook 改的是即将创建的 Pod。
 - **hostPID**：agent 通过 `SO_PEERCRED` 拿到主机 pid，`pid` 标签和 `nvidia-smi` 一致，同一节点上的多个 Pod 也不会撞号。
 - **Pod 归属**：采集库从 `/proc/self/mountinfo` 里 kubelet 挂载的路径读出 Pod UID 和容器名，exporter 用 ServiceAccount 列出本节点的 Pod，换成 `namespace`、`pod`。RBAC 只有 `pods` 的 `get`、`list`。
 - **Service** 是 headless 的，带 `prometheus.io/scrape` 注解。`serviceMonitor.enabled=true` 时生成 ServiceMonitor，`honorLabels: true`，让指标里工作负载的 `namespace`、`pod`、`container` 不被 exporter 自己的 target 标签改名成 `exported_*`。
@@ -98,26 +99,15 @@ helm upgrade --install uvm-insight deploy/helm/uvm-insight -n uvm-insight --crea
 
 `serviceMonitor.labels` 要和 Prometheus 的 `serviceMonitorSelector` 对上，kube-prometheus-stack 一般是 `release: <helm release 名>`。
 
-工作负载自己选择接入：挂上主机目录，设置 `CUDA_INJECTION64_PATH` 和 `UVMI_SOCKET`。完整片段见 `helm install` 输出的 NOTES。环境变量在进程启动时读，改了要重建 Pod。
+Webhook 默认会注入这些 Pod：
 
-```yaml
-env:
-  - name: CUDA_INJECTION64_PATH
-    value: /var/lib/uvm-insight/lib/libuvminsight.so
-  - name: UVMI_SOCKET
-    value: /var/lib/uvm-insight/agent.sock
-volumeMounts:
-  - name: uvm-insight
-    mountPath: /var/lib/uvm-insight
-    readOnly: true
-volumes:
-  - name: uvm-insight
-    hostPath:
-      path: /var/lib/uvm-insight
-      type: Directory
-```
+- 容器申请了 `nvidia.com/gpu`（可用 `webhook.gpuResources` 改）
+- 或者带有 `nvidia.com/use-gpuuuid`（HAMi / Kantaloupe）
+- 或者显式标注 `uvm-insight.dynamia.ai/inject=true`
 
-驱动开着 `RmProfilingAdminOnly` 时，容器还要加 `SYS_ADMIN` capability，见下面「限制」。
+不注入：`uvm-insight.dynamia.ai/inject=false`，以及 `kube-system` 和 chart 自己的命名空间。`failurePolicy` 默认是 `Ignore`，webhook 挂了也不会卡住建 Pod。已经在跑的 Pod 不会被改，需要重建一次。
+
+关掉自动注入：`--set webhook.enabled=false`，再按 NOTES 里的片段手动挂卷、设环境变量。
 
 ## 指标
 

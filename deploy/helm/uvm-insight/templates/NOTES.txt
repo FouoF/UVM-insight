@@ -4,8 +4,28 @@ Metrics:
   kubectl -n {{ .Release.Namespace }} port-forward ds/{{ include "uvm-insight.fullname" . }} {{ .Values.service.port }}
   curl -s localhost:{{ .Values.service.port }}/metrics | grep ^uvm_
 
-The collector is installed on each node at {{ .Values.hostDir }}/lib. A CUDA
-workload opts in by mounting that directory and setting two variables:
+The collector is installed on each node at {{ .Values.hostDir }}/lib.
+
+{{- if .Values.webhook.enabled }}
+
+Automatic injection is on (mutating webhook). A new Pod is patched when:
+  - a container requests {{ join ", " .Values.webhook.gpuResources }}, or
+  - the Pod has annotation nvidia.com/use-gpuuuid (HAMi), or
+  - you set uvm-insight.dynamia.ai/inject=true
+
+Opt out with:
+  metadata:
+    annotations:
+      uvm-insight.dynamia.ai/inject: "false"
+
+Injected fields (mount path {{ .Values.webhook.mountPath | default .Values.hostDir }}):
+  CUDA_INJECTION64_PATH, UVMI_SOCKET, hostPath volume,{{- if .Values.webhook.addSysAdmin }} SYS_ADMIN,{{- end }}
+  annotation uvm-insight.dynamia.ai/injected=true
+
+Already-running Pods are not changed; recreate them to pick up injection.
+{{- else }}
+
+Webhook is disabled. Workloads opt in manually:
 
   spec:
     containers:
@@ -17,7 +37,7 @@ workload opts in by mounting that directory and setting two variables:
             value: {{ .Values.hostDir }}/agent.sock
         securityContext:
           capabilities:
-            add: ["SYS_ADMIN"]   # only when the driver restricts profiling to admins
+            add: ["SYS_ADMIN"]
         volumeMounts:
           - name: uvm-insight
             mountPath: {{ .Values.hostDir }}
@@ -27,7 +47,7 @@ workload opts in by mounting that directory and setting two variables:
         hostPath:
           path: {{ .Values.hostDir }}
           type: Directory
+{{- end }}
 
-The variables must be present when the process starts; changing them requires
-a pod restart. PyTorch images that bundle their own libcupti work as is: the
-collector uses whichever libcupti.so.12 the process has loaded.
+PyTorch images that bundle their own libcupti work as is: the collector uses
+whichever libcupti.so.12 the process has loaded.

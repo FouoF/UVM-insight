@@ -1,0 +1,70 @@
+{{- if .Values.webhook.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "uvm-insight.fullname" . }}-webhook
+  labels:
+    {{- include "uvm-insight.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+spec:
+  replicas: {{ .Values.webhook.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "uvm-insight.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: webhook
+  template:
+    metadata:
+      labels:
+        {{- include "uvm-insight.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: webhook
+    spec:
+      serviceAccountName: {{ include "uvm-insight.fullname" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: webhook
+          image: {{ include "uvm-insight.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - webhook
+            - --listen=:9443
+            - --tls-cert=/certs/tls.crt
+            - --tls-key=/certs/tls.key
+            - --host-dir={{ .Values.hostDir }}
+            {{- with .Values.webhook.mountPath }}
+            - --mount-path={{ . }}
+            {{- end }}
+            - --add-sys-admin={{ .Values.webhook.addSysAdmin }}
+            - --inject-hami={{ .Values.webhook.injectOnHAMi }}
+            - --gpu-resources={{ join "," .Values.webhook.gpuResources }}
+            - --own-namespace={{ .Release.Namespace }}
+            - --ignore-namespaces={{ concat .Values.webhook.ignoreNamespaces (list .Release.Namespace) | uniq | join "," }}
+          ports:
+            - name: https
+              containerPort: 9443
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.webhook.resources | nindent 12 }}
+          volumeMounts:
+            - name: certs
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: certs
+          secret:
+            secretName: {{ include "uvm-insight.fullname" . }}-webhook-certs
+{{- end }}

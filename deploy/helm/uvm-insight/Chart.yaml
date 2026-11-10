@@ -2,5 +2,5 @@ apiVersion: v2
 name: uvm-insight
 description: Prometheus exporter for CUDA unified memory migration, page faults and GPU residency, collected with CUPTI.
 type: application
-version: 0.2.0
+version: 0.3.0
 appVersion: "v0.2.0-dev"

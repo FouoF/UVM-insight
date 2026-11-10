@@ -1,0 +1,66 @@
+{{- if .Values.webhook.enabled }}
+{{- $secretName := printf "%s-webhook-certs" (include "uvm-insight.fullname" .) -}}
+{{- $cn := printf "%s-webhook.%s.svc" (include "uvm-insight.fullname" .) .Release.Namespace -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $secretName -}}
+{{- $caCert := "" -}}
+{{- $tlsCert := "" -}}
+{{- $tlsKey := "" -}}
+{{- if $existing }}
+{{- $caCert = index $existing.data "ca.crt" -}}
+{{- $tlsCert = index $existing.data "tls.crt" -}}
+{{- $tlsKey = index $existing.data "tls.key" -}}
+{{- else }}
+{{- $ca := genCA (printf "%s-ca" (include "uvm-insight.fullname" .)) 3650 -}}
+{{- $cert := genSignedCert $cn nil (list $cn (printf "%s.cluster.local" $cn)) 365 $ca -}}
+{{- $caCert = $ca.Cert | b64enc -}}
+{{- $tlsCert = $cert.Cert | b64enc -}}
+{{- $tlsKey = $cert.Key | b64enc -}}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  labels:
+    {{- include "uvm-insight.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+type: kubernetes.io/tls
+data:
+  ca.crt: {{ $caCert }}
+  tls.crt: {{ $tlsCert }}
+  tls.key: {{ $tlsKey }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ include "uvm-insight.fullname" . }}
+  labels:
+    {{- include "uvm-insight.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+webhooks:
+  - name: inject.uvm-insight.dynamia.ai
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    timeoutSeconds: {{ .Values.webhook.timeoutSeconds }}
+    failurePolicy: {{ .Values.webhook.failurePolicy }}
+    clientConfig:
+      service:
+        name: {{ include "uvm-insight.fullname" . }}-webhook
+        namespace: {{ .Release.Namespace }}
+        path: /mutate
+        port: 443
+      caBundle: {{ $caCert }}
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+        scope: Namespaced
+    {{- with .Values.webhook.namespaceSelector }}
+    namespaceSelector:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.webhook.objectSelector }}
+    objectSelector:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+{{- end }}

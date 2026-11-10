@@ -24,6 +24,10 @@ func main() {
 		runInstall(os.Args[2:])
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "webhook" {
+		runWebhook(os.Args[2:])
+		return
+	}
 	socketPath := flag.String("socket", "/tmp/uvm-insight/agent.sock", "Unix socket the CUPTI collector connects to")
 	listen := flag.String("listen", "127.0.0.1:9400", "HTTP address for the UI, API, and /metrics")
 	retention := flag.Duration("retention", 10*time.Minute, "how long to keep samples and exited processes")
