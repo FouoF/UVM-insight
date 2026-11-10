@@ -3,6 +3,7 @@ apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: {{ include "uvm-insight.fullname" . }}
+  namespace: {{ include "uvm-insight.namespace" . }}
   labels:
     {{- include "uvm-insight.labels" . | nindent 4 }}
     {{- with .Values.serviceMonitor.labels }}

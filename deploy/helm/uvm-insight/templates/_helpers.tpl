@@ -25,3 +25,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- define "uvm-insight.image" -}}
 {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
 {{- end -}}
+
+{{- define "uvm-insight.namespace" -}}
+{{- .Release.Namespace -}}
+{{- end -}}
