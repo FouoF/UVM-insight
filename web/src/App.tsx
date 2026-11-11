@@ -120,11 +120,12 @@ export function App() {
         (t, p) => ({
           managed: t.managed + p.managedBytes,
           resident: t.resident + (p.residentKnown ? p.residentBytes : 0),
+          host: t.host + (p.residentKnown ? p.hostResidentBytes : 0),
           into: t.into + p.htod + p.memcpy,
           back: t.back + p.dtoh,
           faults: t.faults + p.gpuFaults + p.cpuFaults,
         }),
-        { managed: 0, resident: 0, into: 0, back: 0, faults: 0 },
+        { managed: 0, resident: 0, host: 0, into: 0, back: 0, faults: 0 },
       ),
     [procs],
   );
@@ -147,7 +148,7 @@ export function App() {
       <div className="summary">
         <Stat label="进程" value={String(procs.filter((p) => p.active).length)} />
         <Stat label="显存驻留（估算）" value={formatBytes(totals.resident)} />
-        <Stat label="主机侧" value={formatBytes(Math.max(0, totals.managed - totals.resident))} />
+        <Stat label="主机侧" value={formatBytes(totals.host)} />
         <Stat label="迁入显存" value={formatRate(totals.into)} accent="#6ea8fe" />
         <Stat label="迁回主机" value={formatRate(totals.back)} accent="#3dbe7a" />
         <Stat label="缺页" value={`${compact(totals.faults)}/s`} accent="#e6b450" />
@@ -284,9 +285,10 @@ function ProcCard({
 }) {
   const quota = proc.lanes.reduce((n, l) => n + l.quotaBytes, 0);
   const resident = proc.residentKnown ? proc.residentBytes : 0;
+  const host = proc.residentKnown ? proc.hostResidentBytes : 0;
+  const unknown = proc.residentKnown ? Math.max(0, proc.managedBytes - resident - host) : 0;
   const cap = quota > 0 ? Math.min(quota, proc.managedBytes || quota) : proc.managedBytes;
   const ratio = cap > 0 ? resident / cap : 0;
-  const host = Math.max(0, proc.managedBytes - resident);
   const gpu = proc.lanes.map((l) => l.deviceLabel).join(", ") || "—";
   return (
     <button
@@ -316,6 +318,7 @@ function ProcCard({
         </div>
         <div className="meter-sub">
           申请 {formatBytes(proc.managedBytes)}，主机侧 {formatBytes(host)}
+          {unknown > 0 ? `，未观测 ${formatBytes(unknown)}` : ""}
         </div>
       </div>
       <div className="card-stats">

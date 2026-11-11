@@ -50,9 +50,12 @@ type Hello struct {
 	ManagedKnown  bool
 	ResidentBytes uint64
 	// Empty outside Kubernetes.
-	PodUID          string
-	ContainerName   string
-	CuptiAPIVersion uint32
+	PodUID            string
+	ContainerName     string
+	CuptiAPIVersion   uint32
+	HostResidentBytes uint64
+	// "none" | "driver" | "delta"
+	ResidencySource string
 }
 
 type UvmEvent struct {
@@ -92,9 +95,10 @@ type EventBatch struct {
 	Allocs        []AllocEvent
 	Kernels       []KernelEvent
 	Dropped       uint64
-	ManagedBytes  uint64
-	ManagedKnown  bool
-	ResidentBytes uint64
+	ManagedBytes      uint64
+	ManagedKnown      bool
+	ResidentBytes     uint64
+	HostResidentBytes uint64
 }
 
 type Envelope struct {

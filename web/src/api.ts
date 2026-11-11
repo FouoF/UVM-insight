@@ -48,6 +48,7 @@ export type Point = {
   throttling: number;
   remoteMap: number;
   residentMb?: number;
+  hostResidentMb?: number;
 };
 
 export type EventView = {
@@ -126,6 +127,7 @@ export type ProcLive = {
   lastSeen: number;
   managedBytes: number;
   residentBytes: number;
+  hostResidentBytes: number;
   residentKnown: boolean;
   htod: number;
   dtoh: number;

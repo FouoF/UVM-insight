@@ -23,9 +23,11 @@ type Collector struct {
 	thrash   *prometheus.Desc
 	throttle *prometheus.Desc
 	remote   *prometheus.Desc
-	managed  *prometheus.Desc
-	resident *prometheus.Desc
-	dropped  *prometheus.Desc
+	managed          *prometheus.Desc
+	resident         *prometheus.Desc
+	hostResident     *prometheus.Desc
+	residencySource  *prometheus.Desc
+	dropped          *prometheus.Desc
 }
 
 var ident = []string{"namespace", "pod", "container", "pid", "app"}
@@ -94,8 +96,18 @@ func New(store *aggregate.Store) *Collector {
 		),
 		resident: prometheus.NewDesc(
 			"uvm_gpu_resident_bytes",
-			"Estimated unified memory resident on the GPU: migrated in minus evicted, bounded by uvm_managed_allocated_bytes.",
+			"Estimated unified memory resident on the GPU. Part of managed = gpu + host + unknown.",
 			ident, nil,
+		),
+		hostResident: prometheus.NewDesc(
+			"uvm_host_resident_bytes",
+			"Estimated unified memory resident on the host. Part of managed = gpu + host + unknown.",
+			ident, nil,
+		),
+		residencySource: prometheus.NewDesc(
+			"uvm_residency_source",
+			"How resident gauges are produced for this process. source is none, driver, or delta.",
+			with("source"), nil,
 		),
 		dropped: prometheus.NewDesc(
 			"uvm_collector_dropped_events_total",
@@ -116,6 +128,8 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.remote
 	ch <- c.managed
 	ch <- c.resident
+	ch <- c.hostResident
+	ch <- c.residencySource
 	ch <- c.dropped
 }
 
@@ -150,6 +164,12 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	for _, s := range snap.Resident {
 		ch <- prometheus.MustNewConstMetric(c.resident, prometheus.GaugeValue, s.Value, identValues(s.Ident)...)
+	}
+	for _, s := range snap.HostResident {
+		ch <- prometheus.MustNewConstMetric(c.hostResident, prometheus.GaugeValue, s.Value, identValues(s.Ident)...)
+	}
+	for _, s := range snap.ResidencySource {
+		ch <- prometheus.MustNewConstMetric(c.residencySource, prometheus.GaugeValue, 1, identValues(s.Ident, s.Source)...)
 	}
 	for _, s := range snap.Dropped {
 		ch <- prometheus.MustNewConstMetric(c.dropped, prometheus.CounterValue, s.Value, identValues(s.Ident)...)

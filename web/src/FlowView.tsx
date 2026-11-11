@@ -229,7 +229,7 @@ function spawn(key: string, dir: 1 | -1, lg: number, x: number): Particle {
 function drawHost(ctx: CanvasRenderingContext2D, h: number, procs: ProcLive[]) {
   const box = { x: PAD, y: PAD, w: HOST_W, h: h - PAD * 2 };
   panel(ctx, box, "#172033", "#6ea8fe");
-  const host = procs.reduce((n, p) => n + Math.max(0, p.managedBytes - (p.residentKnown ? p.residentBytes : 0)), 0);
+  const host = procs.reduce((n, p) => n + (p.residentKnown ? p.hostResidentBytes : 0), 0);
   const into = procs.reduce((n, p) => n + p.htod + p.memcpy, 0);
   const back = procs.reduce((n, p) => n + p.dtoh, 0);
   let y = box.y + 24;

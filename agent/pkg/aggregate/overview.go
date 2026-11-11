@@ -33,8 +33,9 @@ type ProcLive struct {
 	LastSeen     int64  `json:"lastSeen"`
 	ManagedBytes uint64 `json:"managedBytes"`
 	// Estimated by the collector; only set when ResidentKnown.
-	ResidentBytes uint64  `json:"residentBytes"`
-	ResidentKnown bool    `json:"residentKnown"`
+	ResidentBytes     uint64 `json:"residentBytes"`
+	HostResidentBytes uint64 `json:"hostResidentBytes"`
+	ResidentKnown     bool   `json:"residentKnown"`
 	HtoD          float64 `json:"htod"`
 	DtoH          float64 `json:"dtoh"`
 	Memcpy        float64 `json:"memcpy"`
@@ -167,15 +168,16 @@ func (p *proc) live(now time.Time, history bool) ProcLive {
 	}
 
 	out := ProcLive{
-		PID:           p.hello.PID,
-		AppName:       p.app(),
-		Hostname:      p.hello.Hostname,
-		CudaVersion:   p.hello.CudaVersion,
-		Active:        p.active,
-		LastSeen:      p.lastSeen.UnixMilli(),
-		ManagedBytes:  p.managed,
-		ResidentBytes: p.resident,
-		ResidentKnown: p.managedKnown,
+		PID:               p.hello.PID,
+		AppName:           p.app(),
+		Hostname:          p.hello.Hostname,
+		CudaVersion:       p.hello.CudaVersion,
+		Active:            p.active,
+		LastSeen:          p.lastSeen.UnixMilli(),
+		ManagedBytes:      p.managed,
+		ResidentBytes:     p.resident,
+		HostResidentBytes: p.hostResident,
+		ResidentKnown:     p.managedKnown,
 	}
 	var faultsG, faultsC, thrash uint64
 	for id := from; id <= to; id++ {
@@ -237,22 +239,26 @@ func (p *proc) live(now time.Time, history bool) ProcLive {
 		}
 		return out
 	}
-	// The collector only reports the resident gauge when it moves, so carry
-	// the last value forward. Seconds before the first report in range take
+	// The collector only reports the resident gauges when they move, so carry
+	// the last values forward. Seconds before the first report in range take
 	// that first report.
-	last := p.resident
+	lastGPU := p.resident
+	lastHost := p.hostResident
 	for s := start; s <= now.Unix(); s++ {
 		if b := p.buckets[s]; b != nil && b.hasResident {
-			last = b.resident
+			lastGPU = b.resident
+			lastHost = b.hostResident
 			break
 		}
 	}
 	for sec := start; sec <= now.Unix(); sec++ {
 		pt, _ := p.pointAt(sec)
 		if b := p.buckets[sec]; b != nil && b.hasResident {
-			last = b.resident
+			lastGPU = b.resident
+			lastHost = b.hostResident
 		}
-		pt.ResidentMB = float64(last) / 1e6
+		pt.ResidentMB = float64(lastGPU) / 1e6
+		pt.HostResidentMB = float64(lastHost) / 1e6
 		out.Series = append(out.Series, pt)
 	}
 	return out

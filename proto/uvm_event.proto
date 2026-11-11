@@ -40,6 +40,12 @@ message Hello {
   string container_name = 12;
   // cuptiGetVersion() of the libcupti loaded in this process.
   uint32 cupti_api_version = 13;
+  // Estimated part of managed_bytes resident on the host. With
+  // gpu_resident_bytes, unknown = managed_bytes - gpu - host.
+  uint64 host_resident_bytes = 14;
+  // How gpu/host resident gauges are produced: "none", "driver"
+  // (cuMemGetLocationInfo), or "delta" (CUPTI HtoD/DtoH inference).
+  string residency_source = 15;
 }
 
 message GpuInfo {
@@ -119,4 +125,5 @@ message EventBatch {
   uint64 managed_bytes = 5;
   bool managed_known = 6;
   uint64 gpu_resident_bytes = 7;
+  uint64 host_resident_bytes = 8;
 }

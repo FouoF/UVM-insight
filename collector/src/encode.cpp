@@ -104,6 +104,10 @@ void encodeHello(Buf& envelope, const Hello& hello) {
   body.str(11, hello.pod_uid);
   body.str(12, hello.container_name);
   body.varint(13, hello.cupti_api_version);
+  body.varint(14, hello.host_resident_bytes);
+  if (!hello.residency_source.empty()) {
+    body.str(15, hello.residency_source);
+  }
   envelope.msg(1, body);
 }
 
@@ -183,8 +187,8 @@ bool parseHex(std::string_view s, uint64_t* out) {
   return true;
 }
 
-uint64_t sumNvidiaUvmMaps(std::string_view text) {
-  uint64_t sum = 0;
+std::vector<UvmMapRange> listNvidiaUvmMaps(std::string_view text) {
+  std::vector<UvmMapRange> out;
   size_t i = 0;
   while (i < text.size()) {
     size_t eol = text.find('\n', i);
@@ -206,10 +210,19 @@ uint64_t sumNvidiaUvmMaps(std::string_view text) {
     }
     uint64_t start = 0;
     uint64_t end = 0;
-    if (!parseHex(line.substr(0, dash), &start) || !parseHex(line.substr(dash + 1, sp - dash - 1), &end) || end <= start) {
+    if (!parseHex(line.substr(0, dash), &start) || !parseHex(line.substr(dash + 1, sp - dash - 1), &end) ||
+        end <= start) {
       continue;
     }
-    sum += end - start;
+    out.push_back(UvmMapRange{start, end - start});
+  }
+  return out;
+}
+
+uint64_t sumNvidiaUvmMaps(std::string_view text) {
+  uint64_t sum = 0;
+  for (const UvmMapRange& r : listNvidiaUvmMaps(text)) {
+    sum += r.size;
   }
   return sum;
 }
@@ -237,6 +250,7 @@ void encodeBatch(Buf& envelope, const EventBatch& batch) {
     body.varint(6, 1);
   }
   body.varint(7, batch.gpu_resident_bytes);
+  body.varint(8, batch.host_resident_bytes);
   envelope.msg(2, body);
 }
 

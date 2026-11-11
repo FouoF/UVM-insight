@@ -68,6 +68,8 @@ func encodeHello(h Hello) []byte {
 	b = appendString(b, 11, h.PodUID)
 	b = appendString(b, 12, h.ContainerName)
 	b = appendVarintField(b, 13, uint64(h.CuptiAPIVersion))
+	b = appendVarintField(b, 14, h.HostResidentBytes)
+	b = appendString(b, 15, h.ResidencySource)
 	return b
 }
 
@@ -97,6 +99,7 @@ func encodeBatch(batch EventBatch) []byte {
 		b = appendVarintField(b, 6, 1)
 	}
 	b = appendVarintField(b, 7, batch.ResidentBytes)
+	b = appendVarintField(b, 8, batch.HostResidentBytes)
 	return b
 }
 
@@ -273,6 +276,10 @@ func decodeHello(b []byte) (Hello, error) {
 			var v uint64
 			v, i, err = readVarint(b, i)
 			h.CuptiAPIVersion = uint32(v)
+		case 14:
+			h.HostResidentBytes, i, err = readVarint(b, i)
+		case 15:
+			h.ResidencySource, i, err = readString(b, i)
 		default:
 			i, err = skip(b, i, wire)
 		}
@@ -369,6 +376,8 @@ func decodeBatch(b []byte) (EventBatch, error) {
 			batch.ManagedKnown = v != 0
 		case 7:
 			batch.ResidentBytes, i, err = readVarint(b, i)
+		case 8:
+			batch.HostResidentBytes, i, err = readVarint(b, i)
 		default:
 			i, err = skip(b, i, wire)
 		}

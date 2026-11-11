@@ -9,7 +9,7 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
-foreach(name prefetch alternate oversubscribe thrash)
+foreach(name prefetch alternate oversubscribe thrash residency_hold)
   add_executable(${name} ${name}.cu common.h)
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 endforeach()

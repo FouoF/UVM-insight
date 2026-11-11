@@ -129,6 +129,7 @@ func (s *Store) registerLocked(h protocol.Hello, at time.Time) {
 	if h.ManagedKnown {
 		p.managed = h.ManagedBytes
 		p.resident = h.ResidentBytes
+		p.hostResident = h.HostResidentBytes
 		p.managedKnown = true
 	}
 }
@@ -148,9 +149,11 @@ func (s *Store) ingestLocked(pid uint32, batch protocol.EventBatch, at time.Time
 	if batch.ManagedKnown {
 		p.managed = batch.ManagedBytes
 		p.resident = batch.ResidentBytes
+		p.hostResident = batch.HostResidentBytes
 		p.managedKnown = true
 		b := p.bucket(at.Unix())
 		b.resident = batch.ResidentBytes
+		b.hostResident = batch.HostResidentBytes
 		b.hasResident = true
 	}
 
@@ -175,6 +178,7 @@ type proc struct {
 	managed      uint64
 	managedKnown bool
 	resident     uint64
+	hostResident uint64
 	dropped      uint64
 	allocs       map[uint64]uint64
 	buckets      map[int64]*second
@@ -229,9 +233,10 @@ type second struct {
 	thrash     uint64
 	throttle   uint64
 	remote     uint64
-	// Last resident estimate reported in this second.
-	resident    uint64
-	hasResident bool
+	// Last resident estimates reported in this second.
+	resident     uint64
+	hostResident uint64
+	hasResident  bool
 }
 
 func (p *proc) bucket(sec int64) *second {
@@ -671,8 +676,9 @@ type Point struct {
 	GPUFaults  float64 `json:"gpuFaults"`
 	Thrashing  float64 `json:"thrashing"`
 	Throttling float64 `json:"throttling"`
-	RemoteMap  float64 `json:"remoteMap"`
-	ResidentMB float64 `json:"residentMb"`
+	RemoteMap      float64 `json:"remoteMap"`
+	ResidentMB     float64 `json:"residentMb"`
+	HostResidentMB float64 `json:"hostResidentMb"`
 }
 
 type EventView struct {
@@ -1123,6 +1129,11 @@ type InfoObs struct {
 	CuptiAPI, Driver string
 }
 
+type ResidencySourceObs struct {
+	Ident
+	Source string
+}
+
 type PromSnap struct {
 	Info      []InfoObs
 	Migrated  []CounterObs
@@ -1131,10 +1142,12 @@ type PromSnap struct {
 	Thrash    []CounterObs
 	Throttle  []CounterObs
 	Remote    []CounterObs
-	Managed   []CounterObs
-	Resident  []CounterObs
-	Dropped   []CounterObs
-	Durations []HistObs
+	Managed         []CounterObs
+	Resident        []CounterObs
+	HostResident    []CounterObs
+	ResidencySource []ResidencySourceObs
+	Dropped         []CounterObs
+	Durations       []HistObs
 }
 
 func (s *Store) identLocked(p *proc) Ident {
@@ -1198,8 +1211,14 @@ func (s *Store) Prom() PromSnap {
 			snap.Remote = append(snap.Remote, CounterObs{Ident: id, GPU: k.gpu, GPUUUID: p.gpuUUID(k.gpu), Value: float64(v)})
 		}
 		snap.Managed = append(snap.Managed, CounterObs{Ident: id, Value: float64(p.managed)})
-		if p.managedKnown {
+		src := p.hello.ResidencySource
+		if src == "" {
+			src = "none"
+		}
+		snap.ResidencySource = append(snap.ResidencySource, ResidencySourceObs{Ident: id, Source: src})
+		if p.managedKnown && src != "none" {
 			snap.Resident = append(snap.Resident, CounterObs{Ident: id, Value: float64(p.resident)})
+			snap.HostResident = append(snap.HostResident, CounterObs{Ident: id, Value: float64(p.hostResident)})
 		}
 		snap.Dropped = append(snap.Dropped, CounterObs{Ident: id, Value: float64(p.dropped)})
 		for k, h := range p.hists {

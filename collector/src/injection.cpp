@@ -129,12 +129,43 @@ struct Pending {
   uint64_t dropped = 0;
 };
 
+// Feature 1 — swap events: UVMI_EVENTS. Feature 2 — residency gauges:
+// UVMI_RESIDENCY=off|auto|driver|delta. Location API when available; CUPTI
+// HtoD/DtoH inference as fallback. The two pipelines are independent.
+enum class ResidencyWanted { Off, Auto, Driver, Delta };
+enum class ResidencySrc { None, Driver, Delta };
+
+using CuMemGetLocationInfoFn = CUresult (*)(CUdeviceptr, size_t, size_t, size_t, CUmemLocation*);
+using CuDeviceGetAttributeFn = CUresult (*)(int*, CUdevice_attribute, CUdevice);
+using CuCtxGetCurrentFn = CUresult (*)(CUcontext*);
+using CuCtxSetCurrentFn = CUresult (*)(CUcontext);
+using CuDevicePrimaryCtxRetainFn = CUresult (*)(CUcontext*, CUdevice);
+using CuGetErrorStringFn = CUresult (*)(CUresult, const char**);
+using CuDeviceGetFn = CUresult (*)(CUdevice*, int);
+
 struct Collector {
   std::string socketPath = "/tmp/uvm-insight/agent.sock";
   int flushMs = 200;
+  bool enableEvents = true;  // UVMI_EVENTS — migration / fault CUPTI path
   bool enableMemcpy = true;
   bool enableKernel = true;
   bool quiet = false;
+  ResidencyWanted residencyWanted = ResidencyWanted::Auto;
+  ResidencySrc residencySrc = ResidencySrc::None;
+  // Majority-vote region size / sample stride for cuMemGetLocationInfo.
+  size_t locSummaryBytes = 64ull << 20;
+  size_t locSampleBytes = 2ull << 20;
+  CuMemGetLocationInfoFn locInfoFn = nullptr;
+  CuCtxGetCurrentFn ctxGetCurrentFn = nullptr;
+  CuCtxSetCurrentFn ctxSetCurrentFn = nullptr;
+  CuDevicePrimaryCtxRetainFn primaryRetainFn = nullptr;
+  CuDeviceGetFn deviceGetFn = nullptr;
+  CuGetErrorStringFn getErrorStringFn = nullptr;
+  bool locationApiOk = false;
+  bool residencyDriverActive = false;  // true after a successful location sample
+  bool locQueryWarned = false;
+  // Last CUDA context observed on a CUPTI activity buffer (app thread).
+  CUcontext lastCtx = nullptr;
 
   std::mutex mu;
   Pending pending;
@@ -162,14 +193,17 @@ struct Collector {
   uint64_t managedSent = 0;
   bool managedKnown = false;
   bool managedSentValid = false;
-  // Bytes moved onto the GPU minus bytes evicted, since attach. First-touch
-  // population on the GPU and frees produce no transfer record, so the
-  // resident estimate is this net minus a floor that is pulled along whenever
-  // the estimate would leave [0, managedBytes].
-  int64_t netIn = 0;
-  int64_t netFloor = 0;
+  // Three-way split of managedBytes: gpu + host + unknown.
+  // unknown = managedBytes - gpuBytes - hostBytes is implicit.
+  // Delta mode: HtoD/DtoH move mass between the buckets; a DtoH that exceeds
+  // gpuBytes imputes missing prior GPU residency (first-touch) then credits host.
+  // Driver mode: cuMemGetLocationInfo overwrites these each refresh.
+  uint64_t gpuBytes = 0;
+  uint64_t hostBytes = 0;
   uint64_t resident = 0;
+  uint64_t hostResident = 0;
   uint64_t residentSent = 0;
+  uint64_t hostResidentSent = 0;
 
   std::mutex dropMu;
   std::vector<std::pair<uint64_t, size_t>> dropBase;
@@ -373,6 +407,30 @@ bool isTransfer(uvm::EventKind kind) {
   }
 }
 
+void applyHtoD(Collector& c, uint64_t n) {
+  if (n == 0) {
+    return;
+  }
+  const uint64_t fromHost = std::min(c.hostBytes, n);
+  c.hostBytes -= fromHost;
+  c.gpuBytes += n;
+}
+
+void applyDtoH(Collector& c, uint64_t n) {
+  if (n == 0) {
+    return;
+  }
+  if (c.gpuBytes >= n) {
+    c.gpuBytes -= n;
+    c.hostBytes += n;
+    return;
+  }
+  // gpuBytes underflows: pages were on the GPU without a recorded HtoD
+  // (first-touch). Impute that residency, then move the full transfer to host.
+  c.hostBytes += n;
+  c.gpuBytes = 0;
+}
+
 void fold(const uvm::UvmEvent& ev) {
   AggKey key;
   key.kind = static_cast<uint32_t>(ev.kind);
@@ -390,13 +448,18 @@ void fold(const uvm::UvmEvent& ev) {
   auto& c = C();
   std::lock_guard<std::mutex> lock(c.mu);
   c.agg[key] += n;
+  // Delta residency only; driver mode overwrites gauges in refreshManaged.
+  if (c.residencySrc != ResidencySrc::Delta) {
+    return;
+  }
   switch (ev.kind) {
     case uvm::EventKind::kBytesHtoD:
     case uvm::EventKind::kMemcpyHtoD:
-      c.netIn += static_cast<int64_t>(ev.bytes);
+      applyHtoD(c, ev.bytes);
       break;
     case uvm::EventKind::kBytesDtoH:
-      c.netIn -= static_cast<int64_t>(ev.bytes);
+    case uvm::EventKind::kMemcpyDtoH:
+      applyDtoH(c, ev.bytes);
       break;
     default:
       break;
@@ -568,6 +631,9 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* buffer,
   slot.ctx = ctx;
   slot.stream = streamId;
   std::lock_guard<std::mutex> lock(c.bufMu);
+  if (ctx != nullptr) {
+    c.lastCtx = ctx;
+  }
   c.filled.push_back(slot);
 }
 
@@ -602,6 +668,193 @@ using CuInitFn = CUresult (*)(unsigned int);
 using CuGetCountFn = CUresult (*)(int*);
 using CuGetFn = CUresult (*)(CUdevice*, int);
 using CuNameFn = CUresult (*)(char*, int, CUdevice);
+
+bool probeLocationApi(Collector& c, void* lib, CuGetCountFn cuCount, CuGetFn cuGet) {
+  c.locInfoFn = nullptr;
+  c.locationApiOk = false;
+  auto locFn = reinterpret_cast<CuMemGetLocationInfoFn>(dlsym(lib, "cuMemGetLocationInfo"));
+  auto cuAttr = reinterpret_cast<CuDeviceGetAttributeFn>(dlsym(lib, "cuDeviceGetAttribute"));
+  if (locFn == nullptr || cuAttr == nullptr || cuCount == nullptr || cuGet == nullptr) {
+    return false;
+  }
+  int count = 0;
+  if (cuCount(&count) != CUDA_SUCCESS || count <= 0) {
+    return false;
+  }
+  for (int i = 0; i < count; ++i) {
+    CUdevice dev;
+    if (cuGet(&dev, i) != CUDA_SUCCESS) {
+      return false;
+    }
+    int cma = 0;
+    if (cuAttr(&cma, CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS, dev) != CUDA_SUCCESS || cma == 0) {
+      return false;
+    }
+  }
+  c.locInfoFn = locFn;
+  c.ctxGetCurrentFn = reinterpret_cast<CuCtxGetCurrentFn>(dlsym(lib, "cuCtxGetCurrent"));
+  c.ctxSetCurrentFn = reinterpret_cast<CuCtxSetCurrentFn>(dlsym(lib, "cuCtxSetCurrent"));
+  c.primaryRetainFn = reinterpret_cast<CuDevicePrimaryCtxRetainFn>(dlsym(lib, "cuDevicePrimaryCtxRetain"));
+  c.deviceGetFn = cuGet;
+  c.getErrorStringFn = reinterpret_cast<CuGetErrorStringFn>(dlsym(lib, "cuGetErrorString"));
+  c.locationApiOk = true;
+  return true;
+}
+
+const char* residencySrcName(ResidencySrc src) {
+  switch (src) {
+    case ResidencySrc::Driver:
+      return "driver";
+    case ResidencySrc::Delta:
+      return "delta";
+    default:
+      return "none";
+  }
+}
+
+void resolveResidencySrc(Collector& c) {
+  c.residencySrc = ResidencySrc::None;
+  c.residencyDriverActive = false;
+  switch (c.residencyWanted) {
+    case ResidencyWanted::Off:
+      break;
+    case ResidencyWanted::Driver:
+      if (c.locationApiOk) {
+        c.residencySrc = ResidencySrc::Driver;
+      } else {
+        logf("residency_source=none (driver requested, cuMemGetLocationInfo unavailable)");
+      }
+      break;
+    case ResidencyWanted::Delta:
+      if (c.enableEvents) {
+        c.residencySrc = ResidencySrc::Delta;
+      } else {
+        logf("residency_source=none (delta needs UVMI_EVENTS=1)");
+      }
+      break;
+    case ResidencyWanted::Auto:
+    default:
+      if (c.locationApiOk) {
+        c.residencySrc = ResidencySrc::Driver;
+      } else if (c.enableEvents) {
+        c.residencySrc = ResidencySrc::Delta;
+      }
+      break;
+  }
+  c.hello.residency_source = residencySrcName(c.residencySrc);
+  if (c.residencySrc == ResidencySrc::Driver) {
+    logf("events=%d residency_source=driver summary=%zuMiB sample=%zuMiB", c.enableEvents ? 1 : 0,
+         c.locSummaryBytes >> 20, c.locSampleBytes >> 20);
+  } else {
+    logf("events=%d residency_source=%s", c.enableEvents ? 1 : 0, residencySrcName(c.residencySrc));
+  }
+}
+
+bool ensureCudaContext(Collector& c) {
+  if (c.ctxGetCurrentFn == nullptr || c.ctxSetCurrentFn == nullptr) {
+    return true;
+  }
+  CUcontext cur = nullptr;
+  if (c.ctxGetCurrentFn(&cur) == CUDA_SUCCESS && cur != nullptr) {
+    return true;
+  }
+  // Prefer the context CUPTI attributed activity to; it is the app's context.
+  if (c.lastCtx != nullptr && c.ctxSetCurrentFn(c.lastCtx) == CUDA_SUCCESS) {
+    return true;
+  }
+  if (c.primaryRetainFn == nullptr || c.deviceGetFn == nullptr) {
+    return false;
+  }
+  CUdevice dev;
+  if (c.deviceGetFn(&dev, 0) != CUDA_SUCCESS) {
+    return false;
+  }
+  CUcontext primary = nullptr;
+  if (c.primaryRetainFn(&primary, dev) != CUDA_SUCCESS || primary == nullptr) {
+    return false;
+  }
+  return c.ctxSetCurrentFn(primary) == CUDA_SUCCESS;
+}
+
+bool queryLocationResidency(Collector& c, const std::vector<uvm::UvmMapRange>& ranges, uint64_t* gpuOut,
+                            uint64_t* hostOut) {
+  if (c.locInfoFn == nullptr || ranges.empty()) {
+    return false;
+  }
+  if (!ensureCudaContext(c)) {
+    if (!c.locQueryWarned) {
+      logf("cuMemGetLocationInfo skipped: no CUDA context on collector thread");
+      c.locQueryWarned = true;
+    }
+    return false;
+  }
+  uint64_t gpu = 0;
+  uint64_t host = 0;
+  std::vector<CUmemLocation> locs;
+  int okRanges = 0;
+  CUresult lastErr = CUDA_SUCCESS;
+  for (const uvm::UvmMapRange& r : ranges) {
+    if (r.size == 0) {
+      continue;
+    }
+    size_t summary = c.locSummaryBytes;
+    if (summary == 0 || summary > r.size) {
+      summary = r.size;
+    }
+    size_t sampling = c.locSampleBytes;
+    if (sampling > summary) {
+      sampling = summary;
+    }
+    const size_t n = (r.size + summary - 1) / summary;
+    locs.assign(n, CUmemLocation{});
+    const CUresult st = c.locInfoFn(static_cast<CUdeviceptr>(r.start), static_cast<size_t>(r.size), summary,
+                                    sampling, locs.data());
+    if (st != CUDA_SUCCESS) {
+      // /proc maps can include nvidia-uvm regions that are not queryable
+      // managed allocations (driver bookkeeping). Skip those and keep going.
+      lastErr = st;
+      continue;
+    }
+    ++okRanges;
+    for (size_t i = 0; i < n; ++i) {
+      size_t chunk = summary;
+      if ((i + 1) * summary > r.size) {
+        chunk = static_cast<size_t>(r.size - i * summary);
+      }
+      switch (locs[i].type) {
+        case CU_MEM_LOCATION_TYPE_DEVICE:
+          gpu += chunk;
+          break;
+        case CU_MEM_LOCATION_TYPE_HOST:
+        case CU_MEM_LOCATION_TYPE_HOST_NUMA:
+        case CU_MEM_LOCATION_TYPE_HOST_NUMA_CURRENT:
+          host += chunk;
+          break;
+        default:
+          break;
+      }
+    }
+    if (!c.locQueryWarned && n > 0) {
+      logf("location sample first_type=%d id=%d regions=%zu range=%zuMiB -> gpu=%zuMiB host=%zuMiB",
+           static_cast<int>(locs[0].type), locs[0].id, n, r.size >> 20, gpu >> 20, host >> 20);
+      c.locQueryWarned = true;
+    }
+  }
+  if (okRanges == 0) {
+    if (!c.locQueryWarned) {
+      const char* msg = nullptr;
+      if (c.getErrorStringFn != nullptr && lastErr != CUDA_SUCCESS) {
+        c.getErrorStringFn(lastErr, &msg);
+      }
+      logf("cuMemGetLocationInfo failed: %s", msg != nullptr ? msg : "no queryable ranges");
+      c.locQueryWarned = true;
+    }
+    return false;
+  }
+  *gpuOut = gpu;
+  *hostOut = host;
+  return true;
+}
 using CuMemFn = CUresult (*)(size_t*, CUdevice);
 using CuUuidFn = CUresult (*)(CUuuid*, CUdevice);
 using CuVersionFn = CUresult (*)(int*);
@@ -720,6 +973,8 @@ void fillHello() {
       c.hello.gpus.push_back(std::move(gpu));
     }
   }
+  probeLocationApi(c, lib, cuCount, cuGet);
+  resolveResidencySrc(c);
   c.helloReady = true;
 }
 
@@ -784,42 +1039,71 @@ void refreshManaged(Collector& c) {
     return;
   }
   const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  const std::vector<uvm::UvmMapRange> ranges = uvm::listNvidiaUvmMaps(text);
   const uint64_t before = c.managedBytes;
-  c.managedBytes = uvm::sumNvidiaUvmMaps(text);
+  uint64_t managed = 0;
+  for (const uvm::UvmMapRange& r : ranges) {
+    managed += r.size;
+  }
+  c.managedBytes = managed;
   c.managedKnown = true;
   c.hello.managed_bytes = c.managedBytes;
   c.hello.managed_known = true;
+  c.hello.residency_source = residencySrcName(c.residencySrc);
+
+  uint64_t driverGpu = 0;
+  uint64_t driverHost = 0;
+  const bool gotDriver =
+      c.residencySrc == ResidencySrc::Driver && queryLocationResidency(c, ranges, &driverGpu, &driverHost);
 
   std::lock_guard<std::mutex> lock(c.mu);
-  int64_t est = c.netIn - c.netFloor;
-  // A free leaves no eviction record. Assume the freed range was resident in
-  // the same proportion as the whole footprint.
-  if (before > 0 && c.managedBytes < before && est > 0) {
-    const double keep = static_cast<double>(c.managedBytes) / static_cast<double>(before);
-    const int64_t scaled = static_cast<int64_t>(static_cast<double>(est) * keep);
-    c.netFloor += est - scaled;
-    est = scaled;
+  if (c.residencySrc == ResidencySrc::None) {
+    c.gpuBytes = 0;
+    c.hostBytes = 0;
+  } else if (gotDriver) {
+    c.residencyDriverActive = true;
+    if (driverGpu + driverHost > c.managedBytes && c.managedBytes > 0) {
+      const double scale = static_cast<double>(c.managedBytes) / static_cast<double>(driverGpu + driverHost);
+      driverGpu = static_cast<uint64_t>(static_cast<double>(driverGpu) * scale);
+      driverHost = c.managedBytes - driverGpu;
+    }
+    c.gpuBytes = driverGpu;
+    c.hostBytes = driverHost;
+  } else if (c.residencySrc == ResidencySrc::Delta) {
+    // A free leaves no eviction record. Scale both observed buckets with the
+    // footprint so unknown stays non-negative in proportion.
+    if (before > 0 && c.managedBytes < before) {
+      const double keep = static_cast<double>(c.managedBytes) / static_cast<double>(before);
+      c.gpuBytes = static_cast<uint64_t>(static_cast<double>(c.gpuBytes) * keep);
+      c.hostBytes = static_cast<uint64_t>(static_cast<double>(c.hostBytes) * keep);
+    }
+    const uint64_t accounted = c.gpuBytes + c.hostBytes;
+    if (accounted > c.managedBytes && accounted > 0) {
+      const double scale = static_cast<double>(c.managedBytes) / static_cast<double>(accounted);
+      c.gpuBytes = static_cast<uint64_t>(static_cast<double>(c.gpuBytes) * scale);
+      c.hostBytes = c.managedBytes - c.gpuBytes;
+    }
   }
-  if (est < 0) {
-    c.netFloor = c.netIn;
-    est = 0;
-  }
-  const int64_t cap = static_cast<int64_t>(c.managedBytes);
-  if (est > cap) {
-    c.netFloor = c.netIn - cap;
-    est = cap;
-  }
-  c.resident = static_cast<uint64_t>(est);
+  // Driver mode before the first successful sample: leave prior zeros.
+  c.resident = c.gpuBytes;
+  c.hostResident = c.hostBytes;
   c.hello.gpu_resident_bytes = c.resident;
+  c.hello.host_resident_bytes = c.hostResident;
 }
 
 void drainPending() {
   auto& c = C();
   refreshManaged(c);
-  // Re-send when the estimate moves by 1 MiB; smaller jitter is not worth a frame.
-  const uint64_t moved = c.resident > c.residentSent ? c.resident - c.residentSent : c.residentSent - c.resident;
+  // Re-send when either resident estimate moves by 1 MiB; smaller jitter is not worth a frame.
+  const uint64_t movedGpu =
+      c.resident > c.residentSent ? c.resident - c.residentSent : c.residentSent - c.resident;
+  const uint64_t movedHost = c.hostResident > c.hostResidentSent ? c.hostResident - c.hostResidentSent
+                                                                 : c.hostResidentSent - c.hostResident;
+  const bool residencyOn = c.residencySrc != ResidencySrc::None;
   const bool gaugeDirty =
-      c.managedKnown && (!c.managedSentValid || c.managedSent != c.managedBytes || moved >= (1u << 20));
+      c.managedKnown &&
+      (!c.managedSentValid || c.managedSent != c.managedBytes ||
+       (residencyOn && (movedGpu >= (1u << 20) || movedHost >= (1u << 20))));
   Pending local;
   std::map<AggKey, uint64_t> agg;
   {
@@ -868,7 +1152,10 @@ void drainPending() {
   batch.dropped = local.dropped;
   batch.managed_bytes = c.managedBytes;
   batch.managed_known = c.managedKnown;
-  batch.gpu_resident_bytes = c.resident;
+  if (c.residencySrc != ResidencySrc::None) {
+    batch.gpu_resident_bytes = c.resident;
+    batch.host_resident_bytes = c.hostResident;
+  }
   uvm::Buf env;
   uvm::encodeBatch(env, batch);
   // On failure the whole frame is counted as dropped, including records and
@@ -877,6 +1164,7 @@ void drainPending() {
     c.managedSent = c.managedBytes;
     c.managedSentValid = true;
     c.residentSent = c.resident;
+    c.hostResidentSent = c.hostResident;
   }
 }
 
@@ -904,6 +1192,10 @@ void flushSendQueue() {
 
 bool configureCounters(const char** why);
 
+bool cuptiActive(const Collector& c) {
+  return c.enableEvents || c.enableMemcpy || c.enableKernel;
+}
+
 void workerMain() {
   auto& c = C();
   // Let the driver finish InitializeInjection before touching libcuda.
@@ -917,7 +1209,7 @@ void workerMain() {
   int uvmTries = 0;
   const char* uvmWhy = "";
   while (!c.stop.load()) {
-    if (!uvmOn && !c.disabled.load() && uvmTries < 100) {
+    if (c.enableEvents && !uvmOn && !c.disabled.load() && uvmTries < 100) {
       const char* why = "";
       uvmOn = configureCounters(&why);
       ++uvmTries;
@@ -933,14 +1225,18 @@ void workerMain() {
     if (c.disabled.load()) {
       break;
     }
-    cuptiActivityFlushAll(0);
-    drainBuffers();
+    if (cuptiActive(c)) {
+      cuptiActivityFlushAll(0);
+      drainBuffers();
+    }
     drainPending();
     flushSendQueue();
   }
   if (!c.disabled.load()) {
-    cuptiActivityFlushAll(0);
-    drainBuffers();
+    if (cuptiActive(c)) {
+      cuptiActivityFlushAll(0);
+      drainBuffers();
+    }
     drainPending();
     flushSendQueue();
   }
@@ -998,11 +1294,19 @@ bool configureCounters(const char** why) {
 }
 
 void enableActivities() {
-  CUptiResult st = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMORY2);
-  if (st != CUPTI_SUCCESS) {
-    logf("enable MEMORY2: %s", cuptiErr(st));
-  }
   auto& c = C();
+  if (!cuptiActive(c)) {
+    logf("CUPTI activities skipped (events=%d memcpy=%d kernel=%d)", c.enableEvents ? 1 : 0,
+         c.enableMemcpy ? 1 : 0, c.enableKernel ? 1 : 0);
+    return;
+  }
+  CUptiResult st = CUPTI_SUCCESS;
+  if (c.enableEvents) {
+    st = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMORY2);
+    if (st != CUPTI_SUCCESS) {
+      logf("enable MEMORY2: %s", cuptiErr(st));
+    }
+  }
   if (c.enableKernel) {
     // CONCURRENT_KERNEL keeps kernel launches concurrent. KIND_KERNEL serializes them.
     st = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
@@ -1033,9 +1337,31 @@ void loadConfig() {
   if (c.flushMs < 10) {
     c.flushMs = 10;
   }
-  c.enableMemcpy = envEnabled("UVMI_ENABLE_MEMCPY", true);
-  c.enableKernel = envEnabled("UVMI_ENABLE_KERNEL", true);
+  c.enableEvents = envEnabled("UVMI_EVENTS", true);
+  // Memcpy/kernel only make sense with the event pipeline; force off when events are off.
+  c.enableMemcpy = c.enableEvents && envEnabled("UVMI_ENABLE_MEMCPY", true);
+  c.enableKernel = c.enableEvents && envEnabled("UVMI_ENABLE_KERNEL", true);
   c.quiet = envEnabled("UVMI_QUIET", false);
+  c.residencyWanted = ResidencyWanted::Auto;
+  if (const char* mode = std::getenv("UVMI_RESIDENCY")) {
+    if (std::strcmp(mode, "off") == 0 || std::strcmp(mode, "0") == 0 || std::strcmp(mode, "none") == 0) {
+      c.residencyWanted = ResidencyWanted::Off;
+    } else if (std::strcmp(mode, "driver") == 0) {
+      c.residencyWanted = ResidencyWanted::Driver;
+    } else if (std::strcmp(mode, "delta") == 0) {
+      c.residencyWanted = ResidencyWanted::Delta;
+    } else if (std::strcmp(mode, "auto") == 0) {
+      c.residencyWanted = ResidencyWanted::Auto;
+    }
+  }
+  const int summaryMiB = envInt("UVMI_LOC_SUMMARY_MIB", 64);
+  const int sampleMiB = envInt("UVMI_LOC_SAMPLE_MIB", 2);
+  if (summaryMiB > 0) {
+    c.locSummaryBytes = static_cast<size_t>(summaryMiB) << 20;
+  }
+  if (sampleMiB >= 0) {
+    c.locSampleBytes = static_cast<size_t>(sampleMiB) << 20;
+  }
 }
 
 }  // namespace

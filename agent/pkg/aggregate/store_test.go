@@ -78,8 +78,12 @@ func TestManagedGaugeSurvivesUnknownFree(t *testing.T) {
 	if got := s.Snapshot(7).ManagedBytes; got != 1500<<20 {
 		t.Fatalf("gauge = %d", got)
 	}
-	s.IngestAt(7, protocol.EventBatch{ManagedBytes: 1500 << 20, ManagedKnown: true, ResidentBytes: 1 << 30}, now.Add(-3*time.Second))
-	s.IngestAt(7, protocol.EventBatch{ManagedBytes: 1500 << 20, ManagedKnown: true, ResidentBytes: 200 << 20}, now)
+	s.IngestAt(7, protocol.EventBatch{
+		ManagedBytes: 1500 << 20, ManagedKnown: true, ResidentBytes: 1 << 30, HostResidentBytes: 400 << 20,
+	}, now.Add(-3*time.Second))
+	s.IngestAt(7, protocol.EventBatch{
+		ManagedBytes: 1500 << 20, ManagedKnown: true, ResidentBytes: 200 << 20, HostResidentBytes: 800 << 20,
+	}, now)
 	ov := s.Overview(0, true)
 	var live ProcLive
 	for _, p := range ov.Processes {
@@ -87,12 +91,15 @@ func TestManagedGaugeSurvivesUnknownFree(t *testing.T) {
 			live = p
 		}
 	}
-	if !live.ResidentKnown || live.ResidentBytes != 200<<20 {
+	if !live.ResidentKnown || live.ResidentBytes != 200<<20 || live.HostResidentBytes != 800<<20 {
 		t.Fatalf("resident: %+v", live)
 	}
 	n := len(live.Series)
 	if live.Series[n-2].ResidentMB != float64(1<<30)/1e6 || live.Series[n-1].ResidentMB != float64(200<<20)/1e6 {
 		t.Fatalf("carry forward: %v %v", live.Series[n-2].ResidentMB, live.Series[n-1].ResidentMB)
+	}
+	if live.Series[n-2].HostResidentMB != float64(400<<20)/1e6 || live.Series[n-1].HostResidentMB != float64(800<<20)/1e6 {
+		t.Fatalf("host carry forward: %v %v", live.Series[n-2].HostResidentMB, live.Series[n-1].HostResidentMB)
 	}
 
 	s.Register(protocol.Hello{PID: 8, AppName: "old"})
@@ -116,8 +123,9 @@ func TestPromPodLabels(t *testing.T) {
 	})
 	s.Register(protocol.Hello{
 		PID: 4242, AppName: "esm2", Hostname: "esm2-7f9c", PodUID: "uid-1", ContainerName: "serve",
-		CuptiAPIVersion: 18, ManagedBytes: 1 << 30, ManagedKnown: true, ResidentBytes: 512 << 20,
-		GPUs: []protocol.GpuInfo{{DeviceID: 0, UUID: "GPU-61951b89"}},
+		CuptiAPIVersion: 18, ManagedBytes: 1 << 30, ManagedKnown: true, ResidentBytes: 512 << 20, HostResidentBytes: 256 << 20,
+		ResidencySource: "delta",
+		GPUs:            []protocol.GpuInfo{{DeviceID: 0, UUID: "GPU-61951b89"}},
 	})
 	s.Ingest(4242, protocol.EventBatch{Uvm: []protocol.UvmEvent{{
 		Kind: protocol.KindBytesHtoD, Bytes: 4096, SrcID: cpuID, DstID: 0, Cause: protocol.CauseCoherence,
@@ -139,6 +147,9 @@ func TestPromPodLabels(t *testing.T) {
 	}
 	if len(snap.Resident) != 1 || snap.Resident[0].Value != float64(512<<20) {
 		t.Fatalf("resident: %+v", snap.Resident)
+	}
+	if len(snap.HostResident) != 1 || snap.HostResident[0].Value != float64(256<<20) {
+		t.Fatalf("host resident: %+v", snap.HostResident)
 	}
 	s.Prom()
 	if calls != 2 {

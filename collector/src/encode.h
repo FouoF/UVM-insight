@@ -57,6 +57,11 @@ struct Hello {
   std::string container_name;
   // cuptiGetVersion() of the libcupti this process actually loaded.
   uint32_t cupti_api_version = 0;
+  // Estimated part of managed_bytes resident on the host. With
+  // gpu_resident_bytes, unknown = managed - gpu - host.
+  uint64_t host_resident_bytes = 0;
+  // "none" | "driver" | "delta" — how gpu/host resident gauges are produced.
+  std::string residency_source = "none";
 };
 
 struct UvmEvent {
@@ -99,11 +104,20 @@ struct EventBatch {
   uint64_t managed_bytes = 0;
   bool managed_known = false;
   uint64_t gpu_resident_bytes = 0;
+  uint64_t host_resident_bytes = 0;
 };
 
-// Sums the virtual size of /dev/nvidia-uvm mappings. That is the process's
-// live unified-memory footprint, including allocations made before this
-// collector attached. nvidia-uvm-tools is the profiling device, not memory.
+// One /dev/nvidia-uvm mapping (excluding nvidia-uvm-tools).
+struct UvmMapRange {
+  uint64_t start = 0;
+  uint64_t size = 0;
+};
+
+// Lists live nvidia-uvm VA ranges. Their sizes sum to the process unified
+// memory footprint, including allocations made before this collector attached.
+std::vector<UvmMapRange> listNvidiaUvmMaps(std::string_view text);
+
+// Sums the virtual size of /dev/nvidia-uvm mappings.
 uint64_t sumNvidiaUvmMaps(std::string_view text);
 
 // Finds the kubelet pod directory in /proc/self/mountinfo. Pods get

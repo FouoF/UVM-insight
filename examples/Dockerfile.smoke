@@ -1,0 +1,13 @@
+# Slim image with UVM example binaries for cluster smoke tests.
+FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake g++ \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY CMakeLists.txt common.h prefetch.cu alternate.cu oversubscribe.cu thrash.cu residency_hold.cu ./
+RUN cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES="80;86" \
+  && cmake --build build -j"$(nproc)"
+
+FROM nvidia/cuda:12.6.3-base-ubuntu22.04
+COPY --from=build /src/build/prefetch /src/build/alternate \
+  /src/build/oversubscribe /src/build/thrash /src/build/residency_hold /usr/local/bin/
+ENTRYPOINT ["/bin/bash", "-lc"]

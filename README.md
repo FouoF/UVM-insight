@@ -71,11 +71,17 @@ cmake --build examples/build -j
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `UVMI_SOCKET` | `/tmp/uvm-insight/agent.sock` | agent 的 Unix socket |
-| `UVMI_FLUSH_MS` | `200` | 向 CUPTI 要一批事件的间隔，最小 10 |
+| `UVMI_FLUSH_MS` | `200` | 刷新间隔（ms），最小 10。开了事件时也是向 CUPTI 要一批的间隔 |
 | `UVMI_APP_NAME` | 进程名 | 页面和指标里的应用名 |
-| `UVMI_ENABLE_MEMCPY` | `1` | 同时记录显式拷贝 |
-| `UVMI_ENABLE_KERNEL` | `1` | 记录 kernel 区间。用的是 `CONCURRENT_KERNEL`，不会把 kernel 串行化 |
+| `UVMI_EVENTS` | `1` | 换入换出事件管线（CUPTI UM counter / fault 等）。`0` 时不开迁移类 CUPTI |
+| `UVMI_ENABLE_MEMCPY` | `1` | 同时记录显式拷贝（需 `UVMI_EVENTS=1`） |
+| `UVMI_ENABLE_KERNEL` | `1` | 记录 kernel 区间（需 `UVMI_EVENTS=1`）。用的是 `CONCURRENT_KERNEL` |
 | `UVMI_QUIET` | `0` | 关掉注入库打到 stderr 的日志 |
+| `UVMI_RESIDENCY` | `auto` | 驻留管线：`off` / `auto` / `driver`（`cuMemGetLocationInfo`）/ `delta`（CUPTI HtoD/DtoH 推测）。与事件开关独立；`delta` 需要 `UVMI_EVENTS=1`；`auto` 优先 driver，否则在事件开启时用 delta |
+| `UVMI_LOC_SUMMARY_MIB` | `64` | driver 模式下 location 汇总粒度（MiB） |
+| `UVMI_LOC_SAMPLE_MIB` | `2` | driver 模式下区间内采样步长（MiB）；`0` 表示驱动默认 |
+
+两套功能可单独开关，例如只要驻留真值：`UVMI_EVENTS=0 UVMI_RESIDENCY=driver`；只要换入换出：`UVMI_RESIDENCY=off`。
 
 systemd 单元在 `deploy/uvm-insight-agent.service`，socket 放在 `/run/uvm-insight/agent.sock`。Prometheus 抓取示例在 `deploy/prometheus.yml`。
 
@@ -124,7 +130,9 @@ Webhook 默认会注入这些 Pod：
 | `uvm_remote_map_events_total` | remote map |
 | `uvm_explicit_copy_bytes_total` | 显式拷贝的字节 |
 | `uvm_managed_allocated_bytes` | 进程 `/dev/nvidia-uvm` 映射的虚拟大小，也就是托管内存的总量 |
-| `uvm_gpu_resident_bytes` | 托管内存里估计在显存上的部分：迁入减迁回，限制在 0 和托管总量之间。首次在 GPU 上写入的页没有迁移记录，所以是估算 |
+| `uvm_gpu_resident_bytes` | 托管内存里在显存上的部分（`managed = gpu + host + unknown`）。仅当驻留管线开启时上报 |
+| `uvm_host_resident_bytes` | 托管内存里在主机上的部分（含 `HOST_NUMA`）。仅当驻留管线开启时上报 |
+| `uvm_residency_source` | 驻留来源。`source` 为 `none` / `driver` / `delta` |
 | `uvm_collector_dropped_events_total` | 采集端来不及送出而丢掉的事件 |
 
 几条常用查询：

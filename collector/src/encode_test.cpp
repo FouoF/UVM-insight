@@ -94,6 +94,11 @@ int main(int argc, char** argv) {
   if (uvm::sumNvidiaUvmMaps(maps) != (0x200000ull + 0x2000ull)) {
     return fail("uvm map sum");
   }
+  const auto ranges = uvm::listNvidiaUvmMaps(maps);
+  if (ranges.size() != 2 || ranges[0].start != 0x7f0000000000ull || ranges[0].size != 0x200000ull ||
+      ranges[1].size != 0x2000ull) {
+    return fail("uvm map list");
+  }
 
   const char* mountinfo =
       "830 829 0:52 / / rw,relatime master:1 - overlay overlay rw\n"
